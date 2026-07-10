@@ -1,0 +1,14 @@
+name = "sentiment-ff75"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+[ai]
+binding = "AI"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sentiment-history"
+database_id = "f91ca980-b886-423a-bd6f-f3baea46d181"
+
+[triggers]
+crons = ["0 6,18 * * *"]
