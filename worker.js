@@ -75,7 +75,12 @@ function rsi(closes, period, endIndex) {
 __name(rsi, "rsi");
 async function runTechnicalEvaluation(env) {
   try {
-    const res = await fetch("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=250");
+    const res = await fetch("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=250", {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+      }
+    });
     if (!res.ok)
       throw new Error("CoinGecko market_chart " + res.status);
     const json = await res.json();
