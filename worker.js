@@ -366,6 +366,22 @@ var worker_default = {
         return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
       }
     }
+    if (url.pathname === "/run-technical-eval" && request.method === "GET") {
+      // On-demand trigger — runs the same evaluation the cron job runs, but
+      // immediately, instead of waiting for the next scheduled 6am/18:00 UTC
+      // run. Useful for verifying a fix right away and as a manual "force
+      // refresh" — not wired into CryptoPulse's automatic refresh cycle, so
+      // it doesn't add extra Cloudflare AI calls on every regular page load.
+      await runTechnicalEvaluation(env);
+      try {
+        const { results } = await env.DB.prepare(
+          "SELECT ts, evaluation, score FROM technical_eval ORDER BY ts DESC LIMIT 1"
+        ).all();
+        return new Response(JSON.stringify({ latest: results[0] || null }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
     if (url.pathname === "/technical-eval" && request.method === "GET") {
       try {
         const { results } = await env.DB.prepare(
