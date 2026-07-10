@@ -73,7 +73,56 @@ function rsi(closes, period, endIndex) {
   return 100 - 100 / (1 + rs);
 }
 __name(rsi, "rsi");
+async function evaluateTechnicalsFromCloses(env, closes) {
+  // Pure evaluation — takes a closes[] array as input rather than fetching it
+  // itself. This is what lets CryptoPulse supply its own already-fetched price
+  // data (proven reliable from a real browser) instead of depending on
+  // Cloudflare Workers reaching CoinGecko, which turned out to be rate-limited
+  // (429) on a shared-IP basis — a header/parameter fix couldn't solve that,
+  // since it's not about the request shape, it's about the calling IP pool.
+  if (closes.length < 200)
+    throw new Error("Historique insuffisant (" + closes.length + " points)");
+  const last = closes.length - 1;
+  const currentPrice = closes[last];
+  const tenkan = ichimokuLine(closes, closes, 9, last);
+  const kijun = ichimokuLine(closes, closes, 26, last);
+  const ma50 = sma(closes, 50, last);
+  const ma100 = sma(closes, 100, last);
+  const ma200 = sma(closes, 200, last);
+  const rsi14 = rsi(closes, 14, last);
+  const snapshot = `Prix BTC actuel : $${currentPrice.toFixed(0)}
+Tenkan (9j) : $${tenkan?.toFixed(0) ?? "N/A"} — prix ${currentPrice > tenkan ? "au-dessus" : "en dessous"}
+Kijun (26j) : $${kijun?.toFixed(0) ?? "N/A"} — prix ${currentPrice > kijun ? "au-dessus" : "en dessous"}
+MM50 : $${ma50?.toFixed(0) ?? "N/A"} — prix ${currentPrice > ma50 ? "au-dessus" : "en dessous"}
+MM100 : $${ma100?.toFixed(0) ?? "N/A"} — prix ${currentPrice > ma100 ? "au-dessus" : "en dessous"}
+MM200 : $${ma200?.toFixed(0) ?? "N/A"} — prix ${currentPrice > ma200 ? "au-dessus" : "en dessous"}
+RSI(14) : ${rsi14?.toFixed(1) ?? "N/A"} (>50 = momentum acheteur, <50 = vendeur)`;
+  const prompt = `Tu es un analyste technique crypto façon "Foufi" (analyse Ichimoku/moyennes mobiles/RSI).
+Voici l'état technique actuel du Bitcoin :
+
+${snapshot}
+
+Donne une évaluation courte (3-4 phrases max) dans ce style : identifie si le prix tient
+les niveaux clés (Tenkan/Kijun/MM), commente le RSI par rapport au seuil 50, et conclus sur
+un biais général (haussier/baissier/neutre). Termine ta réponse par une ligne exacte au format :
+SCORE: X (où X est un entier de -2 très baissier à +2 très haussier).`;
+  const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fast", {
+    messages: [{ role: "user", content: prompt }],
+    max_tokens: 400
+  });
+  const text = typeof result.response === "string" ? result.response : JSON.stringify(result.response || "");
+  const scoreMatch = text.match(/SCORE:\s*(-?\d+)/);
+  const score = scoreMatch ? parseInt(scoreMatch[1], 10) : 0;
+  await env.DB.prepare("INSERT INTO technical_eval (ts, evaluation, score) VALUES (?, ?, ?)").bind(Date.now(), text, score).run();
+  await env.DB.prepare(
+    "DELETE FROM technical_eval WHERE id NOT IN (SELECT id FROM technical_eval ORDER BY ts DESC LIMIT 100)"
+  ).run();
+}
+__name(evaluateTechnicalsFromCloses, "evaluateTechnicalsFromCloses");
 async function runTechnicalEvaluation(env) {
+  // Cron wrapper — best-effort automatic path, still tries fetching CoinGecko
+  // itself (may occasionally hit the same shared-IP rate limit). The reliable
+  // path is CryptoPulse calling /run-technical-eval with its own closes[] data.
   try {
     const res = await fetch("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=250", {
       headers: {
@@ -85,43 +134,7 @@ async function runTechnicalEvaluation(env) {
       throw new Error("CoinGecko market_chart " + res.status);
     const json = await res.json();
     const closes = (json.prices || []).map((p) => p[1]);
-    if (closes.length < 200)
-      throw new Error("Historique insuffisant (" + closes.length + " points)");
-    const last = closes.length - 1;
-    const currentPrice = closes[last];
-    const tenkan = ichimokuLine(closes, closes, 9, last);
-    const kijun = ichimokuLine(closes, closes, 26, last);
-    const ma50 = sma(closes, 50, last);
-    const ma100 = sma(closes, 100, last);
-    const ma200 = sma(closes, 200, last);
-    const rsi14 = rsi(closes, 14, last);
-    const snapshot = `Prix BTC actuel : $${currentPrice.toFixed(0)}
-Tenkan (9j) : $${tenkan?.toFixed(0) ?? "N/A"} — prix ${currentPrice > tenkan ? "au-dessus" : "en dessous"}
-Kijun (26j) : $${kijun?.toFixed(0) ?? "N/A"} — prix ${currentPrice > kijun ? "au-dessus" : "en dessous"}
-MM50 : $${ma50?.toFixed(0) ?? "N/A"} — prix ${currentPrice > ma50 ? "au-dessus" : "en dessous"}
-MM100 : $${ma100?.toFixed(0) ?? "N/A"} — prix ${currentPrice > ma100 ? "au-dessus" : "en dessous"}
-MM200 : $${ma200?.toFixed(0) ?? "N/A"} — prix ${currentPrice > ma200 ? "au-dessus" : "en dessous"}
-RSI(14) : ${rsi14?.toFixed(1) ?? "N/A"} (>50 = momentum acheteur, <50 = vendeur)`;
-    const prompt = `Tu es un analyste technique crypto façon "Foufi" (analyse Ichimoku/moyennes mobiles/RSI).
-Voici l'état technique actuel du Bitcoin :
-
-${snapshot}
-
-Donne une évaluation courte (3-4 phrases max) dans ce style : identifie si le prix tient
-les niveaux clés (Tenkan/Kijun/MM), commente le RSI par rapport au seuil 50, et conclus sur
-un biais général (haussier/baissier/neutre). Termine ta réponse par une ligne exacte au format :
-SCORE: X (où X est un entier de -2 très baissier à +2 très haussier).`;
-    const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fast", {
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 400
-    });
-    const text = typeof result.response === "string" ? result.response : JSON.stringify(result.response || "");
-    const scoreMatch = text.match(/SCORE:\s*(-?\d+)/);
-    const score = scoreMatch ? parseInt(scoreMatch[1], 10) : 0;
-    await env.DB.prepare("INSERT INTO technical_eval (ts, evaluation, score) VALUES (?, ?, ?)").bind(Date.now(), text, score).run();
-    await env.DB.prepare(
-      "DELETE FROM technical_eval WHERE id NOT IN (SELECT id FROM technical_eval ORDER BY ts DESC LIMIT 100)"
-    ).run();
+    await evaluateTechnicalsFromCloses(env, closes);
   } catch (err) {
     try {
       await env.DB.prepare("INSERT INTO technical_eval (ts, evaluation, score) VALUES (?, ?, ?)").bind(Date.now(), "ERREUR cron : " + err.message, null).run();
@@ -372,13 +385,29 @@ var worker_default = {
       }
     }
     if (url.pathname === "/run-technical-eval" && request.method === "GET") {
-      // On-demand trigger — runs the same evaluation the cron job runs, but
-      // immediately, instead of waiting for the next scheduled 6am/18:00 UTC
-      // run. Useful for verifying a fix right away and as a manual "force
-      // refresh" — not wired into CryptoPulse's automatic refresh cycle, so
-      // it doesn't add extra Cloudflare AI calls on every regular page load.
+      // On-demand trigger — same as the cron job (Worker fetches CoinGecko
+      // itself), just immediate. Kept as a fallback/manual-test path, but this
+      // is the one that can hit the shared-IP rate limit — prefer POST below.
       await runTechnicalEvaluation(env);
       try {
+        const { results } = await env.DB.prepare(
+          "SELECT ts, evaluation, score FROM technical_eval ORDER BY ts DESC LIMIT 1"
+        ).all();
+        return new Response(JSON.stringify({ latest: results[0] || null }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+    if (url.pathname === "/run-technical-eval" && request.method === "POST") {
+      // Reliable path — CryptoPulse supplies its own already-fetched closes[]
+      // array (proven to work from a real browser), sidestepping the Worker's
+      // CoinGecko rate-limit problem entirely rather than continuing to fight it.
+      try {
+        const { closes } = await request.json();
+        if (!Array.isArray(closes) || closes.length < 200) {
+          return new Response(JSON.stringify({ error: "closes[] (200+ points) requis" }), { status: 400, headers: corsHeaders });
+        }
+        await evaluateTechnicalsFromCloses(env, closes);
         const { results } = await env.DB.prepare(
           "SELECT ts, evaluation, score FROM technical_eval ORDER BY ts DESC LIMIT 1"
         ).all();
