@@ -75,7 +75,7 @@ function rsi(closes, period, endIndex) {
 __name(rsi, "rsi");
 async function runTechnicalEvaluation(env) {
   try {
-    const res = await fetch("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=250&interval=daily");
+    const res = await fetch("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=250");
     if (!res.ok)
       throw new Error("CoinGecko market_chart " + res.status);
     const json = await res.json();
@@ -372,6 +372,53 @@ var worker_default = {
           "SELECT ts, evaluation, score FROM technical_eval ORDER BY ts DESC LIMIT 1"
         ).all();
         return new Response(JSON.stringify({ latest: results[0] || null }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+    if (url.pathname === "/trader-analysis" && request.method === "POST") {
+      try {
+        const data = await request.json();
+        const fmt=(v,d=2)=>v==null?'N/A':(typeof v==='number'?v.toFixed(d):String(v));
+        const sourcesLines=Object.entries(data.sentiment?.sources||{}).map(([k,v])=>`  ${k}: ${v}`).join("\n");
+        const corrLines=Object.entries(data.sourceCorrelations?.perSource||{}).map(([k,v])=>`  ${k}: ${fmt(v)}`).join("\n");
+        const t=data.technicals||{};
+        const pm=data.probabilityModel||{};
+        const btn=data.buyTheNews||{};
+        const dataBlock=`PRICE: $${fmt(data.price,0)}
+
+SENTIMENT - composite: ${fmt(data.sentiment?.composite,0)}/100
+Raw sources:
+${sourcesLines||'  (none)'}
+
+SOURCE-VS-BTC CORRELATION (composite: ${fmt(data.sourceCorrelations?.compositeCorrelation)})
+${corrLines||'  (none)'}
+
+TECHNICALS
+Tenkan: $${fmt(t.tenkan,0)} - Kijun: $${fmt(t.kijun,0)} - MA50: $${fmt(t.ma50,0)} - MA100: $${fmt(t.ma100,0)} - MA200: $${fmt(t.ma200,0)}
+RSI(14): ${fmt(t.rsi14,1)}
+Ichimoku Cloud: ${t.cloud?.position||'N/A'} (Senkou A $${fmt(t.cloud?.senkouA,0)} / B $${fmt(t.cloud?.senkouB,0)})
+Volume: ${t.volume?.trend||'N/A'}
+MA Crossover: ${t.maCrossover?.type?`${t.maCrossover.type} cross, ${t.maCrossover.daysAgo} day(s) ago`:'none in window'}
+Swing structure: ${t.swingStructure||'N/A'}
+RSI/Price divergence: ${t.divergence?.type||'none'}
+
+PROBABILITY MODEL (frequency-based, NOT a guess)
+${pm.insufficient?`Insufficient data (${pm.n||0} matches) - do not state a probability, say so plainly.`:`${Math.round((pm.probUp||0)*100)}% of ${pm.n} historically comparable day(s) (bucket ${pm.bucket}-${(pm.bucket||0)+20}) saw BTC higher 7 days later.`}
+
+BUY THE NEWS VS PRICED IN
+Mechanism 1 (actual vs typical reaction): sentiment shift ${fmt(btn.reaction?.sentimentShift,1)}, actual move ${fmt(btn.reaction?.actualPriceChange)}%, typical move for similar shifts ${fmt(btn.reaction?.typicalChange)}%. Read: ${btn.reaction?.read||'insufficient data'}
+Mechanism 2 (multi-lag correlation pattern): ${(btn.lagPattern?.corrs||[]).map(c=>`${c.lag}h=${fmt(c.corr)}`).join(', ')||'insufficient data'}. Read: ${btn.lagPattern?.read||'insufficient data'}`;
+        const prompt=`You are an experienced crypto trader synthesizing the data below into a short, plain-spoken read for BTC. You must use the exact numbers given - every value below was already calculated; do not compute, estimate, or invent any number not explicitly provided. If a field says "insufficient data" or "N/A", say so plainly rather than guessing or filling in a plausible-sounding figure. Reference specific numbers from the data (e.g. name the actual RSI value, the actual probability, which specific source correlations stand out) rather than vague generalities. 3-4 sentences, trader language, no hedging filler, no financial advice disclaimers (the app shows those separately).
+
+DATA:
+${dataBlock}`;
+        const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fast", {
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 400
+        });
+        const text = typeof result.response === "string" ? result.response : JSON.stringify(result.response || "");
+        return new Response(JSON.stringify({ analysis: text, ts: Date.now() }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
       }
