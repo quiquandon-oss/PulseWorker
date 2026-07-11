@@ -379,7 +379,7 @@ export default {
         const fmt = (v, d = 2) => v == null ? 'N/A' : (typeof v === 'number' ? v.toFixed(d) : String(v));
         const sourcesLines = Object.entries(data.sentiment?.sources || {}).map(([k, v]) => `  ${k}: ${v}`).join('\n');
         const corrLines = Object.entries(data.sourceCorrelations?.perSourceCorrelation || data.sourceCorrelations?.perSource || {})
-          .map(([k, v]) => `  ${k}: ${fmt(typeof v === 'object' ? v.correlation : v)}`).join('\n');
+          .map(([k, v]) => `  ${k}: ${fmt(v && typeof v === 'object' ? v.correlation : v)}`).join('\n');
         const t = data.technicals || {};
         const pm = data.probabilityModel || {};
         const btn = data.buyTheNews || {};
