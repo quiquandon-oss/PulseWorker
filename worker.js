@@ -255,7 +255,7 @@ export default {
         const lagHours = parseFloat(url.searchParams.get('lagHours') || '24');
         const lagMs = lagHours * 60 * 60 * 1000;
         const { results } = await env.DB.prepare(
-          'SELECT ts, score, btc_price as btc, sources_json FROM history ORDER BY ts ASC'
+          'SELECT ts, score, technical_score as technicalScore, btc_price as btc, sources_json FROM history ORDER BY ts ASC'
         ).all();
 
         if (results.length < 20) {
@@ -268,6 +268,11 @@ export default {
 
         const composite = buildPairs(p => p.score);
         const compositeCorr = pearson(composite.xs, composite.ys);
+        // Technical score correlation — only present for points recorded since
+        // technical_score started being sent (older rows have it as null, and
+        // buildPairs already skips any point where the extractor returns null).
+        const technical = buildPairs(p => p.technicalScore);
+        const technicalCorr = pearson(technical.xs, technical.ys);
         const sourceIds = new Set();
         results.forEach(p => {
           if (p.sources_json) {
@@ -288,6 +293,8 @@ export default {
           pointsTotal: results.length,
           compositeSamples: composite.xs.length,
           compositeCorrelation: compositeCorr,
+          technicalSamples: technical.xs.length,
+          technicalCorrelation: technicalCorr,
           perSourceCorrelation: perSource,
           interpretation: 'Corrélation proche de +1 = la source précède bien une hausse future du prix. Proche de -1 = précède une baisse (contrarian). Proche de 0 = pas de lien détecté. Avec peu de jours de données, ces chiffres restent peu fiables statistiquement — à revérifier après accumulation.',
         }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
