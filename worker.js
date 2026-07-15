@@ -216,6 +216,36 @@ export default {
       }
     }
 
+    // ---- POST /backfill-sources — patch specific source values onto EXISTING
+    // history rows, matched by exact ts. Used for retroactively filling in a
+    // newly-added source (e.g. gold) or a source that changed data provider
+    // partway through (e.g. usd moving from FRED to Hyperliquid) — computed
+    // client-side from real historical price data, never invented. Only the
+    // named keys are touched; everything else in that row's sources_json (and
+    // the row's own score/technical_score/btc_price) is left exactly as-is. ----
+    if (url.pathname === '/backfill-sources' && request.method === 'POST') {
+      try {
+        const { updates } = await request.json();
+        if (!Array.isArray(updates)) {
+          return new Response(JSON.stringify({ error: 'updates[] requis' }), { status: 400, headers: corsHeaders });
+        }
+        let rowsPatched = 0;
+        for (const u of updates) {
+          if (!u || typeof u.ts !== 'number' || !u.patch || typeof u.patch !== 'object') continue;
+          for (const [key, val] of Object.entries(u.patch)) {
+            if (typeof val !== 'number') continue;
+            await env.DB.prepare(
+              "UPDATE history SET sources_json = json_set(COALESCE(sources_json,'{}'), '$.' || ?, ?) WHERE ts = ?"
+            ).bind(key, val, u.ts).run();
+          }
+          rowsPatched++;
+        }
+        return new Response(JSON.stringify({ ok: true, rowsPatched }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
     // ---- GET /analysis?lagHours=24 — Pearson correlation, sentiment -> future BTC move ----
     if (url.pathname === '/analysis' && request.method === 'GET') {
       try {
