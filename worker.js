@@ -137,17 +137,18 @@ function parseRssTitles(xml, sourceName) {
 async function sendTelegram(env, text) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.warn('Telegram secrets not configured — alert not sent:', text);
-    return false;
+    return { ok: false, detail: 'TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret not set on the Worker' };
   }
   try {
     const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' }),
     });
-    return res.ok;
+    const body = await res.text();
+    return { ok: res.ok, detail: res.ok ? 'sent' : `Telegram API ${res.status}: ${body}` };
   } catch (err) {
     console.warn('Telegram send failed:', err.message);
-    return false;
+    return { ok: false, detail: 'Network error calling Telegram: ' + err.message };
   }
 }
 
@@ -286,7 +287,7 @@ async function evaluateAlerts(env) {
       const sent = await sendTelegram(env, message);
       await env.DB.prepare('UPDATE alert_configs SET last_fired_ts = ? WHERE id = ?').bind(now, cfg.id).run();
       await env.DB.prepare('INSERT INTO alert_log (ts, config_id, type, message) VALUES (?, ?, ?, ?)')
-        .bind(now, cfg.id, cfg.type, detail + (sent ? '' : ' [Telegram send failed]')).run();
+        .bind(now, cfg.id, cfg.type, detail + (sent.ok ? '' : ' [Telegram: ' + sent.detail + ']')).run();
     }
   }
 }
@@ -479,7 +480,7 @@ export default {
     // ---- POST /test-telegram — manual send, to verify secrets are configured right ----
     if (url.pathname === '/test-telegram' && request.method === 'POST') {
       const sent = await sendTelegram(env, '\u2705 CryptoPulse alerts are wired up correctly. This is a test message.');
-      return new Response(JSON.stringify({ ok: sent }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify(sent), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
     // ---- GET /analysis?lagHours=24 — Pearson correlation, sentiment -> future BTC move ----
