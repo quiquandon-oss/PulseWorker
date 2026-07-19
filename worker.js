@@ -133,6 +133,164 @@ function parseRssTitles(xml, sourceName) {
   return items;
 }
 
+// ---------- Telegram ----------
+async function sendTelegram(env, text) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    console.warn('Telegram secrets not configured — alert not sent:', text);
+    return false;
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn('Telegram send failed:', err.message);
+    return false;
+  }
+}
+
+// ---------- Weekly cheap-window analysis (ported from CryptoPulse's client-side
+// analyzeWeeklyHeatmap, unchanged logic — needs to run here too since the alert
+// cron has no browser to ask) ----------
+function analyzeWeeklyHeatmap(prices) {
+  const weekKey = ts => { const d = new Date(ts); const mon = new Date(d); mon.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return mon.toDateString(); };
+  const weekSum = {};
+  prices.forEach(([ts, p]) => { const k = weekKey(ts); (weekSum[k] ??= { s: 0, n: 0 }); weekSum[k].s += p; weekSum[k].n++; });
+  const weekAvg = {}; Object.keys(weekSum).forEach(k => weekAvg[k] = weekSum[k].s / weekSum[k].n);
+  const cellAgg = {}; const weekMin = {};
+  prices.forEach(([ts, p]) => {
+    const d = new Date(ts), k = weekKey(ts), rel = p / weekAvg[k] - 1;
+    const ck = d.getDay() + '-' + Math.floor(d.getHours() / 3); (cellAgg[ck] ??= { s: 0, n: 0 }); cellAgg[ck].s += rel; cellAgg[ck].n++;
+    if (!weekMin[k] || p < weekMin[k].p) weekMin[k] = { p, day: d.getDay() };
+  });
+  let best = null;
+  for (let day = 0; day < 7; day++) {
+    for (let block = 0; block < 8; block++) {
+      const a = cellAgg[day + '-' + block]; const pct = a && a.n ? (a.s / a.n) * 100 : null;
+      if (a && a.n >= 8 && (!best || pct < best.pct)) best = { day, block, pct };
+    }
+  }
+  return best;
+}
+
+const CG = 'https://api.coingecko.com/api/v3';
+const CG_IDS = { BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', LINK: 'chainlink', HYPE: 'hyperliquid' };
+async function fetchCoinGeckoPrice(sym) {
+  const id = CG_IDS[sym]; if (!id) return null;
+  const res = await fetch(`${CG}/simple/price?ids=${id}&vs_currencies=usd`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+  });
+  if (!res.ok) throw new Error('CoinGecko simple/price ' + res.status);
+  const json = await res.json();
+  return json[id]?.usd ?? null;
+}
+async function fetchCoinGecko7dAvgAndWindow(sym) {
+  const id = CG_IDS[sym]; if (!id) return null;
+  const res = await fetch(`${CG}/coins/${id}/market_chart?vs_currency=usd&days=90`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+  });
+  if (!res.ok) throw new Error('CoinGecko market_chart ' + res.status);
+  const json = await res.json();
+  const prices = json.prices || [];
+  const cutoff = Date.now() - 7 * 86400000;
+  const last7d = prices.filter(([ts]) => ts >= cutoff).map(([, p]) => p);
+  const avg7d = last7d.length ? last7d.reduce((a, b) => a + b, 0) / last7d.length : null;
+  const best = analyzeWeeklyHeatmap(prices);
+  return { avg7d, best };
+}
+
+// ---------- Main alert evaluator — runs every 15 minutes ----------
+async function evaluateAlerts(env) {
+  const now = Date.now();
+  const { results: configs } = await env.DB.prepare('SELECT * FROM alert_configs WHERE enabled = 1').all();
+  if (!configs.length) return;
+
+  // Latest sentiment/technical/gold/funding reading — as fresh as the last time
+  // CryptoPulse was opened, not real-time (this was a deliberate, explicit
+  // trade-off, not an oversight — see conversation history).
+  const { results: latestRows } = await env.DB.prepare('SELECT * FROM history ORDER BY ts DESC LIMIT 1').all();
+  const latest = latestRows[0] || null;
+  let sources = {};
+  try { sources = latest?.sources_json ? JSON.parse(latest.sources_json) : {}; } catch (e) {}
+
+  const priceCache = {}, radarCache = {};
+  async function getPrice(sym) { if (!(sym in priceCache)) priceCache[sym] = await fetchCoinGeckoPrice(sym).catch(() => null); return priceCache[sym]; }
+  async function getRadar(sym) { if (!(sym in radarCache)) radarCache[sym] = await fetchCoinGecko7dAvgAndWindow(sym).catch(() => null); return radarCache[sym]; }
+
+  // Returns { hit: bool, detail: string } for a single leaf condition (also used
+  // to evaluate each side of a combo). Never throws — a data-fetch failure for
+  // one leaf just makes that leaf (and any combo using it) not fire this cycle.
+  async function evalCondition(type, p) {
+    try {
+      if (type === 'price') {
+        const price = await getPrice(p.coin); if (price == null) return { hit: false };
+        const hit = p.direction === 'above' ? price >= p.value : price <= p.value;
+        return { hit, detail: `${p.coin} price $${price.toFixed(2)} (target ${p.direction} $${p.value})` };
+      }
+      if (type === 'radar_discount') {
+        const r = await getRadar(p.coin); if (!r || r.avg7d == null) return { hit: false };
+        const price = await getPrice(p.coin); if (price == null) return { hit: false };
+        const discount = (price - r.avg7d) / r.avg7d * 100;
+        const hit = discount <= -Math.abs(p.discountPct);
+        return { hit, detail: `${p.coin} is ${discount.toFixed(2)}% vs 7d avg (price $${price.toFixed(2)})` };
+      }
+      if (type === 'radar_window') {
+        const r = await getRadar(p.coin); if (!r || !r.best) return { hit: false };
+        const d = new Date();
+        const hit = d.getUTCDay() === r.best.day && Math.floor(d.getUTCHours() / 3) === r.best.block;
+        return { hit, detail: `${p.coin} historically-cheapest weekly window is open now` };
+      }
+      if (type === 'score_threshold') {
+        const val = p.metric === 'technical' ? latest?.technical_score : p.metric === 'combined'
+          ? (latest?.score != null && latest?.technical_score != null ? (latest.score + latest.technical_score) / 2 : null)
+          : latest?.score;
+        if (val == null) return { hit: false };
+        const hit = p.direction === 'above' ? val >= p.value : val <= p.value;
+        return { hit, detail: `${p.metric} score is ${val.toFixed(0)} (target ${p.direction} ${p.value})` };
+      }
+      if (type === 'gold_regime') {
+        const hit = latest?.gold_regime === 'competing-haven';
+        return { hit, detail: 'Gold regime flipped to competing-haven (gold rising at BTC\u2019s expense)' };
+      }
+      if (type === 'funding_spike') {
+        const val = sources[p.source]; if (val == null) return { hit: false };
+        const hit = p.direction === 'above' ? val >= p.value : val <= p.value;
+        return { hit, detail: `${p.source} score is ${val} (target ${p.direction} ${p.value})` };
+      }
+    } catch (err) { return { hit: false }; }
+    return { hit: false };
+  }
+
+  for (const cfg of configs) {
+    let params; try { params = JSON.parse(cfg.params_json); } catch (e) { continue; }
+    const cooldownMs = (cfg.cooldown_minutes || 60) * 60000;
+    if (cfg.last_fired_ts && now - cfg.last_fired_ts < cooldownMs) continue;
+
+    let hit = false, detail = '';
+    if (cfg.type === 'combo') {
+      const [a, b] = params.conditions || [];
+      if (!a || !b) continue;
+      const ra = await evalCondition(a.type, a.params);
+      const rb = await evalCondition(b.type, b.params);
+      hit = ra.hit && rb.hit;
+      detail = [ra.detail, rb.detail].filter(Boolean).join(' AND ');
+    } else {
+      const r = await evalCondition(cfg.type, params);
+      hit = r.hit; detail = r.detail;
+    }
+
+    if (hit) {
+      const message = `\u26a1 <b>CryptoPulse Alert</b>\n${detail}`;
+      const sent = await sendTelegram(env, message);
+      await env.DB.prepare('UPDATE alert_configs SET last_fired_ts = ? WHERE id = ?').bind(now, cfg.id).run();
+      await env.DB.prepare('INSERT INTO alert_log (ts, config_id, type, message) VALUES (?, ?, ?, ?)')
+        .bind(now, cfg.id, cfg.type, detail + (sent ? '' : ' [Telegram send failed]')).run();
+    }
+  }
+}
+
 // ---------- FRED (Federal Reserve St. Louis) series config, used by /macro-proxy ----------
 // Documented here so the meaning of each `series` param CryptoPulse sends is traceable.
 const FRED_SERIES_LABELS = {
@@ -145,7 +303,14 @@ const FRED_SERIES_LABELS = {
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runTechnicalEvaluation(env));
+    // Two crons share this handler now (see wrangler.toml): "0 6,18 * * *" for
+    // the existing technical eval, "*/15 * * * *" for the new alert checker.
+    // event.cron tells us which one fired.
+    if (event.cron === '*/15 * * * *') {
+      ctx.waitUntil(evaluateAlerts(env));
+    } else {
+      ctx.waitUntil(runTechnicalEvaluation(env));
+    }
   },
 
   async fetch(request, env) {
@@ -189,7 +354,7 @@ export default {
     if (url.pathname === '/history' && request.method === 'GET') {
       try {
         const { results } = await env.DB.prepare(
-          'SELECT ts, score, technical_score as technicalScore, btc_price as btc, sources_json FROM history ORDER BY ts DESC LIMIT 500'
+          'SELECT ts, score, technical_score as technicalScore, btc_price as btc, gold_regime as goldRegime, sources_json FROM history ORDER BY ts DESC LIMIT 500'
         ).all();
         return new Response(JSON.stringify({ history: results.reverse() }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
@@ -200,13 +365,13 @@ export default {
     // ---- POST /history — log one snapshot point (sentiment, technical, price, sources) ----
     if (url.pathname === '/history' && request.method === 'POST') {
       try {
-        const { score, technicalScore, btcPrice, sources } = await request.json();
+        const { score, technicalScore, btcPrice, sources, goldRegime } = await request.json();
         if (typeof score !== 'number') {
           return new Response(JSON.stringify({ error: 'score (number) requis' }), { status: 400, headers: corsHeaders });
         }
         const now = Date.now();
-        await env.DB.prepare('INSERT INTO history (ts, score, technical_score, btc_price, sources_json) VALUES (?, ?, ?, ?, ?)')
-          .bind(now, score, typeof technicalScore === 'number' ? technicalScore : null, btcPrice ?? null, sources ? JSON.stringify(sources) : null).run();
+        await env.DB.prepare('INSERT INTO history (ts, score, technical_score, btc_price, gold_regime, sources_json) VALUES (?, ?, ?, ?, ?, ?)')
+          .bind(now, score, typeof technicalScore === 'number' ? technicalScore : null, btcPrice ?? null, goldRegime ?? null, sources ? JSON.stringify(sources) : null).run();
         await env.DB.prepare(
           'DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY ts DESC LIMIT 500)'
         ).run();
@@ -244,6 +409,77 @@ export default {
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
       }
+    }
+
+    // ═══ Alerts system ═══ — config CRUD, log read, and a manual test-send.
+    // The actual checking happens in evaluateAlerts() on the 15-min cron above;
+    // these routes just let CryptoPulse manage what to check.
+
+    // ---- GET /alert-configs — list all (enabled + disabled) ----
+    if (url.pathname === '/alert-configs' && request.method === 'GET') {
+      try {
+        const { results } = await env.DB.prepare('SELECT * FROM alert_configs ORDER BY created_ts DESC').all();
+        return new Response(JSON.stringify({ configs: results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // ---- POST /alert-configs — create a new alert ----
+    if (url.pathname === '/alert-configs' && request.method === 'POST') {
+      try {
+        const { type, params, cooldownMinutes } = await request.json();
+        const validTypes = ['price', 'radar_discount', 'radar_window', 'score_threshold', 'gold_regime', 'funding_spike', 'combo'];
+        if (!validTypes.includes(type)) {
+          return new Response(JSON.stringify({ error: 'type invalide' }), { status: 400, headers: corsHeaders });
+        }
+        const now = Date.now();
+        const res = await env.DB.prepare(
+          'INSERT INTO alert_configs (type, enabled, params_json, cooldown_minutes, created_ts) VALUES (?, 1, ?, ?, ?)'
+        ).bind(type, JSON.stringify(params || {}), cooldownMinutes || 60, now).run();
+        return new Response(JSON.stringify({ ok: true, id: res.meta.last_row_id }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // ---- POST /alert-configs/toggle {id, enabled} ----
+    if (url.pathname === '/alert-configs/toggle' && request.method === 'POST') {
+      try {
+        const { id, enabled } = await request.json();
+        await env.DB.prepare('UPDATE alert_configs SET enabled = ? WHERE id = ?').bind(enabled ? 1 : 0, id).run();
+        return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // ---- POST /alert-configs/delete {id} ----
+    if (url.pathname === '/alert-configs/delete' && request.method === 'POST') {
+      try {
+        const { id } = await request.json();
+        await env.DB.prepare('DELETE FROM alert_configs WHERE id = ?').bind(id).run();
+        return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // ---- GET /alert-log?limit=50 — recently fired alerts ----
+    if (url.pathname === '/alert-log' && request.method === 'GET') {
+      try {
+        const limit = Math.min(200, parseInt(url.searchParams.get('limit') || '50', 10));
+        const { results } = await env.DB.prepare('SELECT * FROM alert_log ORDER BY ts DESC LIMIT ?').bind(limit).all();
+        return new Response(JSON.stringify({ log: results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // ---- POST /test-telegram — manual send, to verify secrets are configured right ----
+    if (url.pathname === '/test-telegram' && request.method === 'POST') {
+      const sent = await sendTelegram(env, '\u2705 CryptoPulse alerts are wired up correctly. This is a test message.');
+      return new Response(JSON.stringify({ ok: sent }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
     // ---- GET /analysis?lagHours=24 — Pearson correlation, sentiment -> future BTC move ----
