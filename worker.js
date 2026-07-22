@@ -719,14 +719,37 @@ ${data.sectorRotation ? `${data.sectorRotation.label} (BTC trend ${fmt(data.sect
 TECHNICAL TIMEFRAME ALIGNMENT (50-MONTH EMA — a multi-year structural level, distinct from the 50/100/200-DAY technicals above which answer a near-term question)
 ${data.technicalAlignment ? `${data.technicalAlignment.label} (price $${fmt(data.technicalAlignment.price, 0)} vs 50mo EMA $${fmt(data.technicalAlignment.ema50, 0)})` : 'Not available this session.'}`;
 
-        const prompt = `You are an experienced crypto trader synthesizing the data below into a short, plain-spoken read for BTC. You must use the exact numbers given - every value below was already calculated; do not compute, estimate, or invent any number not explicitly provided. If a field says "insufficient data", "N/A", or "Not available", say so plainly rather than guessing or filling in a plausible-sounding figure. Reference specific numbers from the data (e.g. name the actual RSI value, the actual probability, which specific source correlations stand out, or a specific regime-scorecard factor) rather than vague generalities. Pay particular attention to whether the short-term, medium-term, and long-term signals AGREE or CONFLICT with each other and with the technicals/sentiment above — a conflict between timeframes (e.g. bullish short-term but bearish long-term) is itself worth naming explicitly, not smoothed over. The event calendar is a CONFIDENCE modifier, not a directional signal — if a nearby FOMC decision is flagged, temper how much conviction you express in the short-term read specifically, without implying the Fed meeting itself is bullish or bearish. If sector rotation shows BTC underperforming Nasdaq, distinguish that explicitly from generic risk-off (it means crypto specifically is out of favor, not just markets broadly). If the 50-day and 50-month technical reads disagree (e.g. short-term bounce but still below the 50-month EMA), call that out explicitly as a timeframe conflict rather than picking one and ignoring the other. 4-5 sentences, trader language, no hedging filler, no financial advice disclaimers (the app shows those separately).
+        const prompt = `You are an experienced crypto trader writing a short, clear BTC market read for someone who wants to understand it in one pass, not decode jargon. You must use the exact numbers given - every value below was already calculated; do not compute, estimate, or invent any number not explicitly provided.
+
+CRITICAL RULES:
+- RSI(14) interpretation: only call it "overbought" if it is ABOVE 70, and only "oversold" if BELOW 30. A value between 50-70 is healthy bullish momentum, NOT overbought — do not mislabel it. Between 30-50 is bearish momentum, NOT oversold.
+- If a field says "insufficient data", "N/A", or "Not available": state that plainly ONCE, then move on. Do NOT follow it with a fabricated claim about that same topic (e.g. never say "not available, but it's probably above X" — if it's not available, you have nothing to say about X, full stop).
+- Never use the internal labels "Mechanism 1" or "Mechanism 2" in your output — translate them into plain questions instead: mechanism 1 (actual vs. typical reaction) becomes something like "has this already been priced in?"; mechanism 2 (multi-lag correlation) becomes something like "is the effect still unfolding?".
+- If a conflict exists between timeframes (short/medium/long-term, or between the regime scorecard's columns), name it explicitly and explain briefly why it might be happening (e.g. crypto-native flows vs. broader macro correlation) rather than just listing both sides.
+- The event calendar (FOMC proximity) is a CONFIDENCE modifier only — it tempers how much weight to put on short-term reads, it is never itself bullish or bearish.
+- If sector rotation shows BTC underperforming Nasdaq, say plainly that this looks like capital rotating away from crypto specifically, not generic risk-off.
+
+OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this displays as raw text, not rendered markdown), structured with blank lines between sections exactly like this:
+
+[One or two sentence summary: current price, overall lean, and the single biggest reason why.]
+
+Sentiment & drivers: [2-3 sentences on composite score, which raw sources are pulling it up or down, and what that implies.]
+
+Technicals: [2-3 sentences on RSI/MAs/Ichimoku/divergence/structure, using the correct RSI interpretation above.]
+
+Timeframe breakdown:
+Short-term (7d): [outlook] - [one-line reason, mention the FOMC confidence caveat here if relevant]
+Medium-term (30-50d): [outlook] - [one-line reason]
+Long-term: [outlook, or "not enough data yet" if genuinely unavailable] - [one-line reason if available]
+
+Key takeaway: [one sentence synthesizing everything above into the single most useful thing to know right now.]
 
 DATA:
 ${dataBlock}`;
 
         const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
           messages: [{ role: 'user', content: prompt }],
-          max_tokens: 400,
+          max_tokens: 650,
         });
         const text = typeof result.response === 'string' ? result.response : JSON.stringify(result.response || '');
         if (!text) throw new Error('Réponse vide du modèle');
