@@ -674,9 +674,18 @@ ${pm.insufficient ? `Insufficient data (${pm.n || 0} matches) - do not state a p
 
 BUY THE NEWS VS PRICED IN
 Mechanism 1 (actual vs typical reaction): sentiment shift ${fmt(btn.reaction?.sentimentShift, 1)}, actual move ${fmt(btn.reaction?.actualPriceChange)}%, typical move for similar shifts ${fmt(btn.reaction?.typicalChange)}%. Read: ${btn.reaction?.read || 'insufficient data'}
-Mechanism 2 (multi-lag correlation pattern): ${(btn.lagPattern?.corrs || []).map(c => `${c.lag}h=${fmt(c.corr)}`).join(', ') || 'insufficient data'}. Read: ${btn.lagPattern?.read || 'insufficient data'}`;
+Mechanism 2 (multi-lag correlation pattern): ${(btn.lagPattern?.corrs || []).map(c => `${c.lag}h=${fmt(c.corr)}`).join(', ') || 'insufficient data'}. Read: ${btn.lagPattern?.read || 'insufficient data'}
 
-        const prompt = `You are an experienced crypto trader synthesizing the data below into a short, plain-spoken read for BTC. You must use the exact numbers given - every value below was already calculated; do not compute, estimate, or invent any number not explicitly provided. If a field says "insufficient data" or "N/A", say so plainly rather than guessing or filling in a plausible-sounding figure. Reference specific numbers from the data (e.g. name the actual RSI value, the actual probability, which specific source correlations stand out) rather than vague generalities. 3-4 sentences, trader language, no hedging filler, no financial advice disclaimers (the app shows those separately).
+REGIME SCORECARD (from the Cycles tab — only present if that tab was visited this session; if absent, do not speculate about it)
+${data.regimeScorecard ? `Overall: ${data.regimeScorecard.bullCount}/${data.regimeScorecard.total} bullish, ${data.regimeScorecard.bearCount}/${data.regimeScorecard.total} bearish - ${data.regimeScorecard.overallLabel}
+Short-term (days): ${(data.regimeScorecard.shortTerm || []).map(f => `${f.label}=${f.display} (${f.tag})`).join(', ')}
+Medium-term (weeks): ${(data.regimeScorecard.midTerm || []).map(f => `${f.label}=${f.display} (${f.tag})`).join(', ')}
+Long-term (months+): ${(data.regimeScorecard.longTerm || []).map(f => `${f.label}=${f.display} (${f.tag})`).join(', ')}` : 'Not available this session.'}
+
+ON-CHAIN VS PRICE (CoinMetrics active addresses, 30d trend, vs BTC price trend over the same window)
+${data.onChainDivergence ? `${data.onChainDivergence.label} (on-chain slope ${fmt(data.onChainDivergence.onchainSlope, 4)}, price slope ${fmt(data.onChainDivergence.priceSlope, 4)})` : 'Not available this session.'}`;
+
+        const prompt = `You are an experienced crypto trader synthesizing the data below into a short, plain-spoken read for BTC. You must use the exact numbers given - every value below was already calculated; do not compute, estimate, or invent any number not explicitly provided. If a field says "insufficient data", "N/A", or "Not available", say so plainly rather than guessing or filling in a plausible-sounding figure. Reference specific numbers from the data (e.g. name the actual RSI value, the actual probability, which specific source correlations stand out, or a specific regime-scorecard factor) rather than vague generalities. Pay particular attention to whether the short-term, medium-term, and long-term signals AGREE or CONFLICT with each other and with the technicals/sentiment above — a conflict between timeframes (e.g. bullish short-term but bearish long-term) is itself worth naming explicitly, not smoothed over. 4-5 sentences, trader language, no hedging filler, no financial advice disclaimers (the app shows those separately).
 
 DATA:
 ${dataBlock}`;
