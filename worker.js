@@ -323,7 +323,7 @@ export default {
     };
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
-    // ---- GET /news-proxy?source=crypto|macro|geopolitics ----
+    // ---- GET /news-proxy?source=crypto|macro|geopolitics|regulatory ----
     if (url.pathname === '/news-proxy' && request.method === 'GET') {
       const source = url.searchParams.get('source');
       try {
@@ -345,7 +345,29 @@ export default {
           const xml = await res.text();
           return new Response(JSON.stringify({ items: parseRssTitles(xml, 'BBC World News') }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         }
-        return new Response(JSON.stringify({ error: 'source doit être crypto, macro ou geopolitics' }), { status: 400, headers: corsHeaders });
+        if (source === 'regulatory') {
+          // Both feeds, per explicit choice — crypto-specific regulatory/legislative
+          // coverage (Clarity Act, SEC actions, etc.) that the generic macro/
+          // geopolitics feeds above aren't focused on catching. Merged and
+          // interleaved by index so one feed being briefly down doesn't wipe out
+          // the whole source (best-effort per-feed, not all-or-nothing).
+          const feeds = [
+            { url: 'https://www.coindesk.com/arc/outboundfeeds/rss/', name: 'CoinDesk' },
+            { url: 'https://www.theblock.co/rss.xml', name: 'The Block' },
+          ];
+          const results = await Promise.allSettled(feeds.map(async f => {
+            const res = await fetch(f.url);
+            if (!res.ok) throw new Error(f.name + ' ' + res.status);
+            return parseRssTitles(await res.text(), f.name);
+          }));
+          const perFeed = results.map(r => r.status === 'fulfilled' ? r.value : []);
+          const merged = [];
+          const maxLen = Math.max(...perFeed.map(a => a.length), 0);
+          for (let i = 0; i < maxLen; i++) perFeed.forEach(a => { if (a[i]) merged.push(a[i]); });
+          if (!merged.length) throw new Error('Both regulatory feeds failed: ' + results.map(r => r.reason?.message).filter(Boolean).join('; '));
+          return new Response(JSON.stringify({ items: merged.slice(0, 15) }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({ error: 'source doit être crypto, macro, geopolitics ou regulatory' }), { status: 400, headers: corsHeaders });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
       }
