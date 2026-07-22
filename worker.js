@@ -716,8 +716,8 @@ ${data.onChainDivergence ? `${data.onChainDivergence.label} (on-chain slope ${fm
 SECTOR ROTATION (BTC's own 30d trend vs Nasdaq's 30d trend, normalized so scale doesn't matter — distinguishes "crypto-specific weakness" from "broad risk-off that's hitting everything")
 ${data.sectorRotation ? `${data.sectorRotation.label} (BTC trend ${fmt(data.sectorRotation.btcSlope * 100, 3)}%/day, Nasdaq trend ${fmt(data.sectorRotation.nasdaqSlope * 100, 3)}%/day)` : 'Not available this session.'}
 
-TECHNICAL TIMEFRAME ALIGNMENT (50-MONTH EMA — a multi-year structural level, distinct from the 50/100/200-DAY technicals above which answer a near-term question)
-${data.technicalAlignment ? `${data.technicalAlignment.label} (price $${fmt(data.technicalAlignment.price, 0)} vs 50mo EMA $${fmt(data.technicalAlignment.ema50, 0)})` : 'Not available this session.'}`;
+TECHNICAL TIMEFRAME ALIGNMENT (50-WEEK EMA — a roughly one-year structural level, distinct from the 50/100/200-DAY technicals above which answer a near-term question)
+${data.technicalAlignment ? `${data.technicalAlignment.label} (price $${fmt(data.technicalAlignment.price, 0)} vs 50wk EMA $${fmt(data.technicalAlignment.ema50, 0)})` : 'Not available this session.'}`;
 
         const prompt = `You are an experienced crypto trader writing a short, clear BTC market read for someone who wants to understand it in one pass, not decode jargon. You must use the exact numbers given - every value below was already calculated; do not compute, estimate, or invent any number not explicitly provided.
 
