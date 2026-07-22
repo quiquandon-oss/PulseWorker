@@ -570,15 +570,20 @@ export default {
       }
     }
 
-    // ---- GET /macro-proxy?series=DGS10&key=XXX — FRED proxy (avoids CORS) ----
+    // ---- GET /macro-proxy?series=DGS10&key=XXX&limit=5 — FRED proxy (avoids CORS) ----
     if (url.pathname === '/macro-proxy' && request.method === 'GET') {
       const series = url.searchParams.get('series');
       const key = url.searchParams.get('key');
+      // Optional, defaults to 5 (unchanged behavior for existing callers) — a
+      // caller wanting a real multi-week trend (e.g. sector-rotation) instead
+      // of just the latest-vs-previous pair can request more, capped at 90 to
+      // keep this a small proxy call, not a bulk data dump.
+      const limit = Math.min(90, Math.max(2, parseInt(url.searchParams.get('limit') || '5', 10) || 5));
       if (!series || !key) {
         return new Response(JSON.stringify({ error: 'series et key requis' }), { status: 400, headers: corsHeaders });
       }
       try {
-        const fredUrl = `https://api.stlouisfed.org/fred/series/observations?series_id=${encodeURIComponent(series)}&api_key=${encodeURIComponent(key)}&file_type=json&sort_order=desc&limit=5`;
+        const fredUrl = `https://api.stlouisfed.org/fred/series/observations?series_id=${encodeURIComponent(series)}&api_key=${encodeURIComponent(key)}&file_type=json&sort_order=desc&limit=${limit}`;
         // cf.cacheTtl:0 + cacheEverything:false: force Cloudflare's edge to
         // never cache this specific outbound request to FRED. Without this,
         // oil (DCOILWTICO) and usd (DTWEXBGS) were observed returning the
