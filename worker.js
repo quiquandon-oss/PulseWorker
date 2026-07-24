@@ -438,13 +438,21 @@ export default {
             to: m[5].trim().replace(/\s*Details.*$/, ''),
           });
         }
-        // If nothing matched, include cheap diagnostics rather than a silent
-        // empty array — distinguishes "genuinely no transfers this window"
-        // from "the fetch got blocked/stripped down and never had real
-        // content to match against" without needing to guess blindly again.
-        const debug = items.length === 0
-          ? { htmlLength: html.length, containsTransferredWord: plain.includes('transferred') }
-          : undefined;
+        // If nothing matched, include a real text sample rather than guess at
+        // another regex fix blindly — this shows EXACTLY what the text looks
+        // like around a real transfer mention (spacing, hidden characters,
+        // unexpected formatting) so the next fix is evidence-based.
+        let debug;
+        if (items.length === 0) {
+          const idx = plain.indexOf('transferred');
+          const sampleAroundTransferred = idx >= 0 ? plain.slice(Math.max(0, idx - 150), idx + 150) : null;
+          debug = {
+            htmlLength: html.length,
+            containsTransferredWord: plain.includes('transferred'),
+            containsDollarSign: plain.includes('$'),
+            sampleAroundTransferred,
+          };
+        }
         return new Response(JSON.stringify({ items, ...(debug ? { debug } : {}) }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
