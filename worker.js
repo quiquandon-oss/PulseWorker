@@ -424,7 +424,12 @@ export default {
           .replace(/<br\s*\/?>/gi, '\n')
           .replace(/<\/div>/gi, '\n')
           .replace(/<[^>]+>/g, ' ')
-          .replace(/&amp;/g, '&').replace(/&#35;/g, '#').replace(/&#36;/g, '$').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+          // Generic numeric HTML entity decode (&#36; or &#036; or any other
+          // zero-padding — parseInt tolerates leading zeros) instead of
+          // hardcoding specific entities one at a time and finding a new bug
+          // for each padding variant, which is exactly what happened here.
+          .replace(/&#0*(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
+          .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
           .replace(/[ \t]+/g, ' ');
         const re = /([\d,]+(?:\.\d+)?)\s+\$([A-Z0-9]{2,10})\s+\(([\d,]+)\s*USD\)\s+transferred from ([^\n]+?) to ([^\n]+?)(?=\n|$)/g;
         const items = [];
