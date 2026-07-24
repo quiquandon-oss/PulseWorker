@@ -424,7 +424,7 @@ export default {
           .replace(/<br\s*\/?>/gi, '\n')
           .replace(/<\/div>/gi, '\n')
           .replace(/<[^>]+>/g, ' ')
-          .replace(/&amp;/g, '&').replace(/&#35;/g, '#').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+          .replace(/&amp;/g, '&').replace(/&#35;/g, '#').replace(/&#36;/g, '$').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
           .replace(/[ \t]+/g, ' ');
         const re = /([\d,]+(?:\.\d+)?)\s+\$([A-Z0-9]{2,10})\s+\(([\d,]+)\s*USD\)\s+transferred from ([^\n]+?) to ([^\n]+?)(?=\n|$)/g;
         const items = [];
