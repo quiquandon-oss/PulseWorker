@@ -373,6 +373,56 @@ export default {
       }
     }
 
+    // ---- GET /whale-proxy — Whale Alert mirrors its own feed (same data that
+    // costs $29.95-$699/mo via their official API) to a public Telegram
+    // channel for free: t.me/s/whale_alert_io. That /s/ path is Telegram's
+    // documented public-preview feature (built for embedding), not a scraping
+    // workaround — different situation from scraping X, which has no
+    // equivalent free/intentional public surface.
+    // Parses the alert PATTERN directly out of the page's visible text
+    // ("821 $BTC (52,363,952 USD) transferred from #Kraken to unknown
+    // wallet") rather than depending on Telegram's exact div/class names —
+    // the pattern is confirmed stable (verified against the live page before
+    // writing this), the class names are not, and depending on the latter
+    // would be the most fragile possible choice for a page with no documented
+    // schema. Mint/burn events ("250,000,000 $USDC ... minted at USDC
+    // Treasury") and analysis/story posts are deliberately NOT captured —
+    // only wallet-to-wallet transfers are a directional flow signal.
+    // No per-item timestamp extraction — the preview page only ever returns
+    // roughly the last ~20 messages, which is used as-is as "recent" rather
+    // than filtered to a precise window; simpler and far more robust than
+    // pairing timestamps to messages via fragile positional matching. ----
+    if (url.pathname === '/whale-proxy' && request.method === 'GET') {
+      try {
+        const res = await fetch('https://t.me/s/whale_alert_io');
+        if (!res.ok) throw new Error('Telegram t.me ' + res.status);
+        const html = await res.text();
+        const plain = html
+          .replace(/<script[\s\S]*?<\/script>/g, ' ')
+          .replace(/<style[\s\S]*?<\/style>/g, ' ')
+          .replace(/<br\s*\/?>/gi, '\n')
+          .replace(/<\/div>/gi, '\n')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&amp;/g, '&').replace(/&#35;/g, '#').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+          .replace(/[ \t]+/g, ' ');
+        const re = /([\d,]+(?:\.\d+)?)\s+\$([A-Z0-9]{2,10})\s+\(([\d,]+)\s*USD\)\s+transferred from ([^\n]+?) to ([^\n]+?)(?=\n|$)/g;
+        const items = [];
+        let m;
+        while ((m = re.exec(plain)) !== null && items.length < 50) {
+          items.push({
+            qty: parseFloat(m[1].replace(/,/g, '')),
+            symbol: m[2],
+            usd: parseFloat(m[3].replace(/,/g, '')),
+            from: m[4].trim().replace(/\s*Details.*$/, ''),
+            to: m[5].trim().replace(/\s*Details.*$/, ''),
+          });
+        }
+        return new Response(JSON.stringify({ items }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
+      }
+    }
+
     // ---- GET /history — sentiment + technical score history for the combined chart ----
     if (url.pathname === '/history' && request.method === 'GET') {
       try {
