@@ -266,8 +266,18 @@ async function evaluateAlerts(env) {
 
   for (const cfg of configs) {
     let params; try { params = JSON.parse(cfg.params_json); } catch (e) { continue; }
-    const cooldownMs = (cfg.cooldown_minutes || 60) * 60000;
-    if (cfg.last_fired_ts && now - cfg.last_fired_ts < cooldownMs) continue;
+    // ---- Fire-twice-then-disable: an alert fires once, then at most one
+    // follow-up exactly FOLLOWUP_MS later if the condition is STILL true,
+    // then auto-disables. Replaces the old indefinite cooldown-repeat model,
+    // which would re-fire forever (every cooldown_minutes) for as long as a
+    // condition stayed true — e.g. a price alert re-firing hourly for days
+    // while price just sat above the target. cooldown_minutes is no longer
+    // used for repeat gating; kept in the schema only for backward
+    // compatibility with existing rows. ----
+    const FOLLOWUP_MS = 4 * 60 * 60 * 1000;
+    const fireCount = cfg.fire_count || 0;
+    if (fireCount >= 2) continue; // already fired twice — stays disabled until manually re-enabled
+    if (fireCount === 1 && cfg.last_fired_ts && now - cfg.last_fired_ts < FOLLOWUP_MS) continue; // waiting out the 4h gap before the follow-up
 
     let hit = false, detail = '';
     if (cfg.type === 'combo') {
@@ -283,11 +293,14 @@ async function evaluateAlerts(env) {
     }
 
     if (hit) {
-      const message = `\u26a1 <b>CryptoPulse Alert</b>\n${detail}`;
+      const newCount = fireCount + 1;
+      const label = newCount === 1 ? '' : ' (follow-up — this alert is now disabled)';
+      const message = `\u26a1 <b>CryptoPulse Alert</b>${label}\n${detail}`;
       const sent = await sendTelegram(env, message);
-      await env.DB.prepare('UPDATE alert_configs SET last_fired_ts = ? WHERE id = ?').bind(now, cfg.id).run();
+      const stillEnabled = newCount < 2 ? 1 : 0;
+      await env.DB.prepare('UPDATE alert_configs SET last_fired_ts = ?, fire_count = ?, enabled = ? WHERE id = ?').bind(now, newCount, stillEnabled, cfg.id).run();
       await env.DB.prepare('INSERT INTO alert_log (ts, config_id, type, message) VALUES (?, ?, ?, ?)')
-        .bind(now, cfg.id, cfg.type, detail + (sent.ok ? '' : ' [Telegram: ' + sent.detail + ']')).run();
+        .bind(now, cfg.id, cfg.type, detail + label + (sent.ok ? '' : ' [Telegram: ' + sent.detail + ']')).run();
     }
   }
 }
@@ -520,7 +533,15 @@ export default {
     if (url.pathname === '/alert-configs/toggle' && request.method === 'POST') {
       try {
         const { id, enabled } = await request.json();
-        await env.DB.prepare('UPDATE alert_configs SET enabled = ? WHERE id = ?').bind(enabled ? 1 : 0, id).run();
+        // Re-enabling resets fire_count so the alert gets a fresh
+        // fire-once-then-followup-then-disable cycle, rather than
+        // immediately re-disabling itself next cron tick because it had
+        // already used both of its fires from before.
+        if (enabled) {
+          await env.DB.prepare('UPDATE alert_configs SET enabled = 1, fire_count = 0, last_fired_ts = NULL WHERE id = ?').bind(id).run();
+        } else {
+          await env.DB.prepare('UPDATE alert_configs SET enabled = 0 WHERE id = ?').bind(id).run();
+        }
         return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
