@@ -407,7 +407,15 @@ export default {
     // pairing timestamps to messages via fragile positional matching. ----
     if (url.pathname === '/whale-proxy' && request.method === 'GET') {
       try {
-        const res = await fetch('https://t.me/s/whale_alert_io');
+        // A default Workers fetch() sends no User-Agent, which can make
+        // Telegram (and many sites) serve a stripped-down/empty response
+        // instead of the real page — this mimics a normal browser request.
+        const res = await fetch('https://t.me/s/whale_alert_io', {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        });
         if (!res.ok) throw new Error('Telegram t.me ' + res.status);
         const html = await res.text();
         const plain = html
@@ -430,7 +438,14 @@ export default {
             to: m[5].trim().replace(/\s*Details.*$/, ''),
           });
         }
-        return new Response(JSON.stringify({ items }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        // If nothing matched, include cheap diagnostics rather than a silent
+        // empty array — distinguishes "genuinely no transfers this window"
+        // from "the fetch got blocked/stripped down and never had real
+        // content to match against" without needing to guess blindly again.
+        const debug = items.length === 0
+          ? { htmlLength: html.length, containsTransferredWord: plain.includes('transferred') }
+          : undefined;
+        return new Response(JSON.stringify({ items, ...(debug ? { debug } : {}) }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
       }
