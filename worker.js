@@ -441,16 +441,24 @@ export default {
         // If nothing matched, include a real text sample rather than guess at
         // another regex fix blindly — this shows EXACTLY what the text looks
         // like around a real transfer mention (spacing, hidden characters,
-        // unexpected formatting) so the next fix is evidence-based.
+        // unexpected formatting) so the next fix is evidence-based. Char
+        // codes (numbers) are included too, immune to any HTML
+        // re-interpretation that could silently mislead a text sample alone
+        // (exactly what happened with the first attempt at this).
         let debug;
         if (items.length === 0) {
           const idx = plain.indexOf('transferred');
           const sampleAroundTransferred = idx >= 0 ? plain.slice(Math.max(0, idx - 150), idx + 150) : null;
+          const tickerMatch = plain.match(/\d\s*.{0,4}(USDT|USDC|BTC|ETH|SOL|LINK)\b/);
+          const charsBeforeTicker = tickerMatch
+            ? tickerMatch[0].split('').map(c => ({ char: c, code: c.charCodeAt(0) }))
+            : null;
           debug = {
             htmlLength: html.length,
             containsTransferredWord: plain.includes('transferred'),
             containsDollarSign: plain.includes('$'),
             sampleAroundTransferred,
+            charsBeforeTicker,
           };
         }
         return new Response(JSON.stringify({ items, ...(debug ? { debug } : {}) }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
