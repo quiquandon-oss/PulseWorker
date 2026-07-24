@@ -472,6 +472,49 @@ export default {
       }
     }
 
+    // ---- POST /whale-analysis — LLM narration of the whale transfers
+    // CryptoPulse already fetched and classified (exchange outflow/inflow).
+    // Same rule as /trader-analysis: the Worker only explains numbers it's
+    // given, it never computes or invents one. Written for someone with no
+    // trading background — explains outflow/inflow in plain terms the first
+    // time, flags repeated exchange patterns if present, and is explicitly
+    // forbidden from calling this "smart money" or predicting price, since
+    // this data has no entity-level attribution and isn't backtested. ----
+    if (url.pathname === '/whale-analysis' && request.method === 'POST') {
+      try {
+        const { transfers } = await request.json();
+        if (!Array.isArray(transfers) || !transfers.length) {
+          return new Response(JSON.stringify({ error: 'transfers[] requis et non vide' }), { status: 400, headers: corsHeaders });
+        }
+        const lines = transfers.slice(0, 10).map(t =>
+          `${t.symbol} $${(t.usd / 1e6).toFixed(1)}M moved from "${t.from}" to "${t.to}" — classified as ${t.direction === 'outflow' ? 'OUTFLOW (left a named exchange for an unlabeled wallet)' : 'INFLOW (moved from an unlabeled wallet onto a named exchange)'}`
+        ).join('\n');
+        const prompt = `You are explaining a list of recent large cryptocurrency exchange movements to someone with NO trading background, in the simplest possible everyday language.
+
+DATA (each line is one real transfer that already happened; OUTFLOW/INFLOW labels were already determined, do not recompute or second-guess them):
+${lines}
+
+RULES:
+- The very first time you use the word "outflow" or "inflow" in your answer, briefly explain what it means in plain words (outflow = coins left an exchange for a private wallet, often read as someone moving funds off the exchange rather than preparing to sell; inflow = coins moved onto an exchange, often read as possible preparation to trade or sell, though it could also just mean depositing for other reasons).
+- If two or more transfers involve the SAME exchange name, point that out explicitly as a repeated pattern, since a repeated pattern is more meaningful than one isolated transfer.
+- Do NOT call any of this "smart money" — there is no information here about WHO moved these coins, only that a named exchange was on one side.
+- Do NOT state or imply that this predicts a future price move. This is not backtested or statistically validated.
+- End with one plain sentence reminding the reader that a single transfer usually means very little on its own, and this is background context, not a signal to act on.
+- Keep the entire answer to 3-5 short sentences, no jargon, no markdown symbols.`;
+        const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 350,
+        });
+        const text = typeof result.response === 'string' ? result.response : JSON.stringify(result.response || '');
+        if (!text) throw new Error('Empty model response');
+        return new Response(JSON.stringify({ analysis: text.trim(), ts: Date.now() }), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
     // ---- GET /history — sentiment + technical score history for the combined chart ----
     if (url.pathname === '/history' && request.method === 'GET') {
       try {
