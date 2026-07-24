@@ -717,7 +717,10 @@ SECTOR ROTATION (BTC's own 30d trend vs Nasdaq's 30d trend, normalized so scale 
 ${data.sectorRotation ? `${data.sectorRotation.label} (BTC trend ${fmt(data.sectorRotation.btcSlope * 100, 3)}%/day, Nasdaq trend ${fmt(data.sectorRotation.nasdaqSlope * 100, 3)}%/day)` : 'Not available this session.'}
 
 TECHNICAL TIMEFRAME ALIGNMENT (50-WEEK EMA — a roughly one-year structural level, distinct from the 50/100/200-DAY technicals above which answer a near-term question)
-${data.technicalAlignment ? `${data.technicalAlignment.label} (price $${fmt(data.technicalAlignment.price, 0)} vs 50wk EMA $${fmt(data.technicalAlignment.ema50, 0)})` : 'Not available this session.'}`;
+${data.technicalAlignment ? `${data.technicalAlignment.label} (price $${fmt(data.technicalAlignment.price, 0)} vs 50wk EMA $${fmt(data.technicalAlignment.ema50, 0)})` : 'Not available this session.'}
+
+TOP HEADLINES (individual news items behind the sentiment sources above, ranked by how strongly each one scored — NOT the same as the aggregate source numbers; these are the specific real headlines driving them)
+${(data.topHeadlines || []).length ? data.topHeadlines.map(h => `  [${h.category}, score ${fmt(h.score, 0)}] "${h.title}"`).join('\n') : '  (none available this cycle)'}`;
 
         const prompt = `You are an experienced crypto trader writing a short, clear BTC market read for someone who wants to understand it in one pass, not decode jargon. You must use the exact numbers given - every value below was already calculated; do not compute, estimate, or invent any number not explicitly provided.
 
@@ -728,6 +731,7 @@ CRITICAL RULES:
 - If a conflict exists between timeframes (short/medium/long-term, or between the regime scorecard's columns), name it explicitly and explain briefly why it might be happening (e.g. crypto-native flows vs. broader macro correlation) rather than just listing both sides.
 - The event calendar (FOMC proximity) is a CONFIDENCE modifier only — it tempers how much weight to put on short-term reads, it is never itself bullish or bearish.
 - If sector rotation shows BTC underperforming Nasdaq, say plainly that this looks like capital rotating away from crypto specifically, not generic risk-off.
+- For the Geopolitical & Macro Drivers section: use ONLY the headlines listed in TOP HEADLINES, verbatim topic (you may paraphrase the headline briefly, do not invent an event not present in that list). Pick the 3 to 5 with the largest |score|. For each, give the headline's topic in a few words and one sentence on why it plausibly matters for BTC (e.g. risk-off/risk-on transmission, inflation/rate-cut expectations, dollar strength, haven demand) — do not assert a causal price move you weren't given data for. If TOP HEADLINES is empty or says "(none available this cycle)", say plainly that no headline-level detail was available this cycle and do not invent any events.
 
 OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this displays as raw text, not rendered markdown), structured with blank lines between sections exactly like this:
 
@@ -736,6 +740,8 @@ OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this di
 Sentiment & drivers: [2-3 sentences on composite score, which raw sources are pulling it up or down, and what that implies.]
 
 Technicals: [2-3 sentences on RSI/MAs/Ichimoku/divergence/structure, using the correct RSI interpretation above.]
+
+Geopolitical & Macro Drivers: [3 to 5 bullet-style lines (use a leading dash, not a markdown bullet), each naming one headline topic from TOP HEADLINES and one sentence on its plausible market impact. If none available, say so plainly in one sentence instead of a list.]
 
 Timeframe breakdown:
 Short-term (7d): [outlook] - [one-line reason, mention the FOMC confidence caveat here if relevant]
