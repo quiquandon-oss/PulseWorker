@@ -530,6 +530,62 @@ RULES:
       }
     }
 
+    // ---- POST /liquidation-analysis — LLM narration of CryptoPulse's
+    // modeled liquidation levels (leverage-tier calculation on real
+    // Hyperliquid mark price + funding), the crowding/elevated flags, and the
+    // monthly persistence check — all already computed by CryptoPulse, the
+    // Worker only explains them. Gives a DAILY reading (today's snapshot) and
+    // a separate MONTHLY reading (has this crowding been persistent or is it
+    // new) for the focus asset, since those are genuinely different
+    // information, not the same snapshot restated twice. Explicitly
+    // forbidden from treating the model as measured real positions or a
+    // price prediction — every public liquidation heatmap makes the same
+    // entry-price assumption this does, and says so; this must too. ----
+    if (url.pathname === '/liquidation-analysis' && request.method === 'POST') {
+      try {
+        const { assets, focus } = await request.json();
+        if (!assets || typeof assets !== 'object' || !Object.keys(assets).length) {
+          return new Response(JSON.stringify({ error: 'assets{} requis et non vide' }), { status: 400, headers: corsHeaders });
+        }
+        const lines = Object.entries(assets).map(([sym, d]) => {
+          const levelsStr = (d.levels || []).map(l =>
+            `${l.leverage}x: long liq $${l.longLiq.toFixed(l.longLiq < 10 ? 4 : 0)}, short liq $${l.shortLiq.toFixed(l.shortLiq < 10 ? 4 : 0)}`
+          ).join(' | ');
+          const crowdStr = d.flags?.crowded
+            ? `${d.flags.crowdedSide === 'long' ? 'LONGS' : 'SHORTS'} crowded (premium ${d.premiumPct >= 0 ? '+' : ''}${d.premiumPct.toFixed(1)}% APR), nearest ${d.flags.crowdedSide} liq level is ${d.flags.nearestDistPct.toFixed(1)}% away${d.flags.elevated ? ' — ELEVATED FLAG (within the 8% proximity threshold)' : ''}`
+            : `balanced, no strongly crowded side (premium ${d.premiumPct >= 0 ? '+' : ''}${d.premiumPct.toFixed(1)}% APR)`;
+          const monthlyStr = d.monthly
+            ? `Monthly persistence: this same side has been dominant in ${d.monthly.pct}% of the last ${d.monthly.count} logged readings`
+            : 'Monthly persistence: not enough logged history yet to say whether this is new or sustained';
+          return `${sym}: mark price $${d.markPx.toFixed(d.markPx < 10 ? 4 : 0)}. Modeled liquidation levels (assuming a position opened at today's price): ${levelsStr}. Crowding: ${crowdStr}. ${monthlyStr}.`;
+        }).join('\n');
+        const prompt = `You are explaining a modeled crypto liquidation-level snapshot to someone with NO trading background, in the simplest possible everyday language. The focus asset for this explanation is ${focus || 'BTC'}, but you may briefly mention other assets only if they show an ELEVATED FLAG.
+
+DATA (already computed by CryptoPulse — do not recompute, second-guess, or invent any number; all leverage tiers, prices, and flags are given, not your job to determine):
+${lines}
+
+RULES:
+- The first time you use the term "liquidation level" or "liquidation price", explain in plain words what it means: a modeled price at which a leveraged position would be automatically force-closed by the exchange, assuming someone opened that position today at the current price.
+- Explicitly say this is a MODEL based on standard leverage tiers and real mark price / funding data — NOT measured real positions, since no public source gives that (every public liquidation heatmap, including the well-known paid ones, makes this same assumption).
+- Give a DAILY reading for the focus asset: today's crowding direction (which side, longs or shorts, is currently more exposed) and how close the nearest relevant level is right now, in 1-2 plain sentences.
+- Give a separate MONTHLY reading for the focus asset: whether this same crowding direction has been persistent over the logged history, or whether today's reading is new/different from the recent pattern, in 1 plain sentence. If there's not enough logged history, say so plainly instead of guessing.
+- If any asset (including ones other than the focus) shows an ELEVATED FLAG, mention it explicitly: explain that a crowded side with its liquidation level very close to the current price means forced selling or buying could accelerate a move if price reaches that level — but do NOT say this WILL happen or WHEN.
+- Do NOT state or imply this predicts a future price move or its timing. This is a model, not a forecast.
+- Keep the entire answer to 5-7 short sentences, no jargon, no markdown symbols.`;
+        const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 450,
+        });
+        const text = typeof result.response === 'string' ? result.response : JSON.stringify(result.response || '');
+        if (!text) throw new Error('Empty model response');
+        return new Response(JSON.stringify({ analysis: text.trim(), ts: Date.now() }), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
     // ---- GET /history — sentiment + technical score history for the combined chart ----
     if (url.pathname === '/history' && request.method === 'GET') {
       try {
