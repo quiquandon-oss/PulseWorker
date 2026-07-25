@@ -543,7 +543,7 @@ RULES:
     // entry-price assumption this does, and says so; this must too. ----
     if (url.pathname === '/liquidation-analysis' && request.method === 'POST') {
       try {
-        const { assets, focus } = await request.json();
+        const { assets, focus, chartContext } = await request.json();
         if (!assets || typeof assets !== 'object' || !Object.keys(assets).length) {
           return new Response(JSON.stringify({ error: 'assets{} requis et non vide' }), { status: 400, headers: corsHeaders });
         }
@@ -559,22 +559,36 @@ RULES:
             : 'Monthly persistence: not enough logged history yet to say whether this is new or sustained';
           return `${sym}: mark price $${d.markPx.toFixed(d.markPx < 10 ? 4 : 0)}. Modeled liquidation levels (assuming a position opened at today's price): ${levelsStr}. Crowding: ${crowdStr}. ${monthlyStr}.`;
         }).join('\n');
+        // The actual heatmap the user is looking at (specific asset + range
+        // currently selected) — the real "next fresh cluster" prices computed
+        // the SAME way the chart itself draws them, so the narration can cite
+        // real numbers from the visible graph instead of only the coarser
+        // per-tier snapshot above.
+        let chartLine = '';
+        if (chartContext && chartContext.livePrice) {
+          const pctAbove = chartContext.nextClusterAbove != null ? ((chartContext.nextClusterAbove - chartContext.livePrice) / chartContext.livePrice * 100) : null;
+          const pctBelow = chartContext.nextClusterBelow != null ? ((chartContext.livePrice - chartContext.nextClusterBelow) / chartContext.livePrice * 100) : null;
+          chartLine = `\n\nCURRENT GRAPH (${chartContext.asset}, ${chartContext.range} view — this is literally what the user is looking at right now): live price $${chartContext.livePrice.toFixed(chartContext.livePrice < 10 ? 4 : 0)}. `
+            + (pctAbove != null ? `Nearest fresh (un-eaten) significant cluster ABOVE price: $${chartContext.nextClusterAbove.toFixed(chartContext.nextClusterAbove < 10 ? 4 : 0)}, which is ${pctAbove.toFixed(1)}% higher. ` : 'No significant fresh cluster above price in the visible range. ')
+            + (pctBelow != null ? `Nearest fresh (un-eaten) significant cluster BELOW price: $${chartContext.nextClusterBelow.toFixed(chartContext.nextClusterBelow < 10 ? 4 : 0)}, which is ${pctBelow.toFixed(1)}% lower.` : 'No significant fresh cluster below price in the visible range.');
+        }
         const prompt = `You are explaining a modeled crypto liquidation-level snapshot to someone with NO trading background, in the simplest possible everyday language. The focus asset for this explanation is ${focus || 'BTC'}, but you may briefly mention other assets only if they show an ELEVATED FLAG.
 
 DATA (already computed by CryptoPulse — do not recompute, second-guess, or invent any number; all leverage tiers, prices, and flags are given, not your job to determine):
-${lines}
+${lines}${chartLine}
 
 RULES:
 - The first time you use the term "liquidation level" or "liquidation price", explain in plain words what it means: a modeled price at which a leveraged position would be automatically force-closed by the exchange, assuming someone opened that position today at the current price.
 - Explicitly say this is a MODEL based on standard leverage tiers and real mark price / funding data — NOT measured real positions, since no public source gives that (every public liquidation heatmap, including the well-known paid ones, makes this same assumption).
+- If CURRENT GRAPH data is present, reference its exact cluster prices and % distances directly — that's literally the chart the user is looking at, so cite it specifically (e.g. "the next real cluster above is about $X, roughly Y% away") rather than only speaking generally.
 - Give a DAILY reading for the focus asset: today's crowding direction (which side, longs or shorts, is currently more exposed) and how close the nearest relevant level is right now, in 1-2 plain sentences.
 - Give a separate MONTHLY reading for the focus asset: whether this same crowding direction has been persistent over the logged history, or whether today's reading is new/different from the recent pattern, in 1 plain sentence. If there's not enough logged history, say so plainly instead of guessing.
 - If any asset (including ones other than the focus) shows an ELEVATED FLAG, mention it explicitly: explain that a crowded side with its liquidation level very close to the current price means forced selling or buying could accelerate a move if price reaches that level — but do NOT say this WILL happen or WHEN.
 - Do NOT state or imply this predicts a future price move or its timing. This is a model, not a forecast.
-- Keep the entire answer to 5-7 short sentences, no jargon, no markdown symbols.`;
+- Keep the entire answer to 6-8 short sentences, no jargon, no markdown symbols.`;
         const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
           messages: [{ role: 'user', content: prompt }],
-          max_tokens: 450,
+          max_tokens: 480,
         });
         const text = typeof result.response === 'string' ? result.response : JSON.stringify(result.response || '');
         if (!text) throw new Error('Empty model response');
