@@ -951,6 +951,22 @@ RULES:
             : 'Not enough logged history yet to say if this crowding direction is new or sustained over time.';
           liqLines = `${aboveTxt}\n${belowTxt}\n${crowdTxt} ${monthlyTxt}`;
         }
+        const wa = data.whaleActivity || null;
+        let waLines = null;
+        if (wa) {
+          const c = wa.concentration || {};
+          const flagsTxt = (c.flags || []).map(f => f.type === 'concentration'
+            ? `${f.count} transfers concentrated at ${f.exchange}`
+            : `bidirectional flow at ${f.exchange} (in $${((f.inflowUsd || 0) / 1e6).toFixed(1)}M / out $${((f.outflowUsd || 0) / 1e6).toFixed(1)}M)`
+          ).join('; ') || 'none flagged';
+          const topTxt = (wa.transfers || []).slice(0, 5).map(t =>
+            `  ${t.symbol} $${(t.usd / 1e6).toFixed(1)}M ${t.direction === 'outflow' ? 'OUT of' : 'INTO'} an exchange (${t.from} -> ${t.to})`
+          ).join('\n');
+          waLines = `Total tracked transfer volume this snapshot: $${((c.totalUsd || 0) / 1e6).toFixed(1)}M${c.highVolume ? ' (above the disclosed high-volume floor)' : ''}.
+Pattern flags: ${flagsTxt}.
+Largest transfers:
+${topTxt || '  (none)'}`;
+        }
 
         const dataBlock = `PRICE: $${fmt(data.price, 0)}
 
@@ -972,6 +988,9 @@ RSI/Price divergence: ${t.divergence?.type || 'none'}
 
 LIQUIDATION CLUSTERS (Hyperliquid-modeled, BTC-focused - only present if the Liquidation tab was visited this session with BTC focused; if absent, do not mention liquidation clusters at all)
 ${liqLines}
+
+WHALE ACTIVITY (large exchange-flow transfers - only ever present when high current volatility has been detected client-side; if absent, do NOT mention whale activity, volatility being high or low, or speculate about either)
+${waLines || 'Not applicable right now - high volatility not currently detected, or whale data not fetched this session.'}
 
 PROBABILITY MODEL (frequency-based, NOT a guess)
 ${pm.insufficient ? `Insufficient data (${pm.n || 0} matches) - do not state a probability, say so plainly.` : `${Math.round((pm.probUp || 0) * 100)}% of ${pm.n} historically comparable day(s) (bucket ${pm.bucket}-${(pm.bucket || 0) + 20}) saw BTC higher 7 days later.`}
@@ -1009,6 +1028,8 @@ CRITICAL RULES:
 - The event calendar (FOMC proximity) is a CONFIDENCE modifier only — it tempers how much weight to put on short-term reads, it is never itself bullish or bearish.
 - If sector rotation shows BTC underperforming Nasdaq, say plainly that this looks like capital rotating away from crypto specifically, not generic risk-off.
 - LIQUIDATION CLUSTERS, if present, belongs INSIDE the Technicals section (never its own heading) as 1-2 extra plain-language sentences: current price, the nearest cluster above and below with their distance in % and modeled probability of being reached within the stated horizon, and today's crowding read. State the historical hit-rate or "not enough data yet" for calibration, and the monthly persistence or "not enough logged history yet", exactly as given - never guess these when the data says they're unavailable. If LIQUIDATION CLUSTERS says "Not available this session", do not mention liquidation clusters at all.
+- WHALE ACTIVITY, if present, ALSO belongs INSIDE the Technicals section (never its own heading), as 1 extra plain-language sentence on what the large-transfer pattern suggests (e.g. exchange outflows read as accumulation/reduced sell-side supply, inflows as potential distribution, bidirectional flow at the same exchange as repositioning/uncertainty) - state only what the transfer directions and flags actually show, never invent a motive. WHALE ACTIVITY only ever appears when high volatility has genuinely been detected - if it says "Not applicable right now", do not mention whale activity, large transfers, or volatility being high or low anywhere in your output.
+- Key takeaway must explicitly factor in LIQUIDATION CLUSTERS and WHALE ACTIVITY, when present, if either points to a plausible near-term price impact (e.g. a very close and reasonably probable cluster, or whale flow reinforcing or contradicting the rest of the read) - don't force them in if neither adds anything beyond what's already said elsewhere.
 - For the Geopolitical & Macro Drivers section: use ONLY the headlines listed in TOP HEADLINES, verbatim topic (you may paraphrase the headline briefly, do not invent an event not present in that list). Pick the 3 to 5 with the largest |score|. For each, give the headline's topic in a few words and one sentence on why it plausibly matters for BTC (e.g. risk-off/risk-on transmission, inflation/rate-cut expectations, dollar strength, haven demand) — do not assert a causal price move you weren't given data for. If TOP HEADLINES is empty or says "(none available this cycle)", say plainly that no headline-level detail was available this cycle and do not invent any events.
 
 OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this displays as raw text, not rendered markdown), structured with blank lines between sections exactly like this:
@@ -1017,7 +1038,7 @@ OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this di
 
 Sentiment & drivers: [2-3 sentences on composite score, which raw sources are pulling it up or down, and what that implies.]
 
-Technicals: [2-3 sentences on RSI/MAs/Ichimoku/divergence/structure, using the correct RSI interpretation above. If LIQUIDATION CLUSTERS data is present, add 1-2 more sentences folding in the nearby modeled clusters, their distance/probability, and today's crowding read - in plain everyday language, not jargon.]
+Technicals: [2-3 sentences on RSI/MAs/Ichimoku/divergence/structure, using the correct RSI interpretation above. If LIQUIDATION CLUSTERS data is present, add 1-2 more sentences folding in the nearby modeled clusters, their distance/probability, and today's crowding read - in plain everyday language, not jargon. If WHALE ACTIVITY is present, add 1 more sentence on what the large-transfer pattern suggests.]
 
 Geopolitical & Macro Drivers: [3 to 5 bullet-style lines (use a leading dash, not a markdown bullet), each naming one headline topic from TOP HEADLINES and one sentence on its plausible market impact. If none available, say so plainly in one sentence instead of a list.]
 
@@ -1026,7 +1047,7 @@ Short-term (7d): [outlook] - [one-line reason, mention the FOMC confidence cavea
 Medium-term (30-50d): [outlook] - [one-line reason]
 Long-term: [outlook, or "not enough data yet" if genuinely unavailable] - [one-line reason if available]
 
-Key takeaway: [one sentence synthesizing everything above into the single most useful thing to know right now.]
+Key takeaway: [one sentence synthesizing everything above into the single most useful thing to know right now, explicitly weighing liquidation clusters and/or whale activity when present and relevant.]
 
 DATA:
 ${dataBlock}`;
