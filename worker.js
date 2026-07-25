@@ -571,6 +571,24 @@ RULES:
           chartLine = `\n\nCURRENT GRAPH (${chartContext.asset}, ${chartContext.range} view — this is literally what the user is looking at right now): live price $${chartContext.livePrice.toFixed(chartContext.livePrice < 10 ? 4 : 0)}. `
             + (pctAbove != null ? `Nearest fresh (un-eaten) significant cluster ABOVE price: $${chartContext.nextClusterAbove.toFixed(chartContext.nextClusterAbove < 10 ? 4 : 0)}, which is ${pctAbove.toFixed(1)}% higher. ` : 'No significant fresh cluster above price in the visible range. ')
             + (pctBelow != null ? `Nearest fresh (un-eaten) significant cluster BELOW price: $${chartContext.nextClusterBelow.toFixed(chartContext.nextClusterBelow < 10 ? 4 : 0)}, which is ${pctBelow.toFixed(1)}% lower.` : 'No significant fresh cluster below price in the visible range.');
+          // Probability of reaching each cluster within the current horizon —
+          // computed by CryptoPulse using the same volatility model already
+          // used for Break-even Probability elsewhere in the app, NOT
+          // computed or estimated by you. Calibration (if present) is a real
+          // check of past predictions of similar confidence against what
+          // actually happened, not a theoretical adjustment.
+          if (chartContext.probAbove != null) {
+            chartLine += `\n\nMODELED PROBABILITY of reaching the cluster ABOVE within this ${chartContext.range} horizon: ${(chartContext.probAbove * 100).toFixed(0)}% (from CryptoPulse's volatility model, already computed — do not recompute).`;
+            chartLine += chartContext.calibrationAbove
+              ? ` Historical calibration: among ${chartContext.calibrationAbove.count} past predictions of similar confidence, ${(chartContext.calibrationAbove.empiricalRate * 100).toFixed(0)}% actually hit their target (${chartContext.calibrationAbove.totalResolved} total resolved predictions logged so far).`
+              : ' Not enough resolved historical predictions yet to check this model\u2019s real accuracy for similar setups.';
+          }
+          if (chartContext.probBelow != null) {
+            chartLine += `\n\nMODELED PROBABILITY of reaching the cluster BELOW within this ${chartContext.range} horizon: ${(chartContext.probBelow * 100).toFixed(0)}% (from CryptoPulse's volatility model, already computed — do not recompute).`;
+            chartLine += chartContext.calibrationBelow
+              ? ` Historical calibration: among ${chartContext.calibrationBelow.count} past predictions of similar confidence, ${(chartContext.calibrationBelow.empiricalRate * 100).toFixed(0)}% actually hit their target (${chartContext.calibrationBelow.totalResolved} total resolved predictions logged so far).`
+              : ' Not enough resolved historical predictions yet to check this model\u2019s real accuracy for similar setups.';
+          }
         }
         const prompt = `You are explaining a modeled crypto liquidation-level snapshot to someone with NO trading background, in the simplest possible everyday language. The focus asset for this explanation is ${focus || 'BTC'}, but you may briefly mention other assets only if they show an ELEVATED FLAG.
 
@@ -581,11 +599,12 @@ RULES:
 - The first time you use the term "liquidation level" or "liquidation price", explain in plain words what it means: a modeled price at which a leveraged position would be automatically force-closed by the exchange, assuming someone opened that position today at the current price.
 - Explicitly say this is a MODEL based on standard leverage tiers and real mark price / funding data — NOT measured real positions, since no public source gives that (every public liquidation heatmap, including the well-known paid ones, makes this same assumption).
 - If CURRENT GRAPH data is present, reference its exact cluster prices and % distances directly — that's literally the chart the user is looking at, so cite it specifically (e.g. "the next real cluster above is about $X, roughly Y% away") rather than only speaking generally.
+- If a MODELED PROBABILITY is present, state it plainly as a modeled estimate (e.g. "the model gives roughly a 30% chance of reaching that level"), never as a confident forecast or guarantee. Include the calibration sentence exactly as given — if it says not enough data yet, say that plainly rather than implying the model is unproven or proven either way.
 - Give a DAILY reading for the focus asset: today's crowding direction (which side, longs or shorts, is currently more exposed) and how close the nearest relevant level is right now, in 1-2 plain sentences.
 - Give a separate MONTHLY reading for the focus asset: whether this same crowding direction has been persistent over the logged history, or whether today's reading is new/different from the recent pattern, in 1 plain sentence. If there's not enough logged history, say so plainly instead of guessing.
 - If any asset (including ones other than the focus) shows an ELEVATED FLAG, mention it explicitly: explain that a crowded side with its liquidation level very close to the current price means forced selling or buying could accelerate a move if price reaches that level — but do NOT say this WILL happen or WHEN.
 - Do NOT state or imply this predicts a future price move or its timing. This is a model, not a forecast.
-- Keep the entire answer to 6-8 short sentences, no jargon, no markdown symbols.`;
+- Keep the entire answer to 7-9 short sentences, no jargon, no markdown symbols.`;
         const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
           messages: [{ role: 'user', content: prompt }],
           max_tokens: 480,
