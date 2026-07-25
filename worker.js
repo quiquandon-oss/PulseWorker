@@ -931,6 +931,26 @@ RULES:
         const t = data.technicals || {};
         const pm = data.probabilityModel || {};
         const btn = data.buyTheNews || {};
+        const lc = data.liquidationClusters || null;
+        const distPct = (target, live) => (target == null || live == null) ? null : ((target / live - 1) * 100);
+        let liqLines = 'Not available this session.';
+        if (lc) {
+          const distAbove = distPct(lc.nextClusterAbove, lc.livePrice);
+          const distBelow = distPct(lc.nextClusterBelow, lc.livePrice);
+          const aboveTxt = lc.nextClusterAbove != null
+            ? `Next cluster ABOVE: $${fmt(lc.nextClusterAbove, 0)} (${fmt(Math.abs(distAbove), 1)}% higher). Modeled P(reach within ${lc.horizonDays}-day horizon) = ${Math.round((lc.probAbove || 0) * 100)}%. ${lc.calibrationAbove ? `Historically, similar predictions have actually hit ${Math.round(lc.calibrationAbove.empiricalRate * 100)}% of the time (${lc.calibrationAbove.count} comparable past case(s)).` : "Not enough resolved history yet to check this model's accuracy."}`
+            : 'No cluster above within range.';
+          const belowTxt = lc.nextClusterBelow != null
+            ? `Next cluster BELOW: $${fmt(lc.nextClusterBelow, 0)} (${fmt(Math.abs(distBelow), 1)}% lower). Modeled P(reach within ${lc.horizonDays}-day horizon) = ${Math.round((lc.probBelow || 0) * 100)}%. ${lc.calibrationBelow ? `Historically, similar predictions have actually hit ${Math.round(lc.calibrationBelow.empiricalRate * 100)}% of the time (${lc.calibrationBelow.count} comparable past case(s)).` : "Not enough resolved history yet to check this model's accuracy."}`
+            : 'No cluster below within range.';
+          const crowdTxt = lc.crowded
+            ? `${lc.crowdedSide === 'long' ? 'Longs' : 'Shorts'} are crowded today, nearest relevant level about ${fmt(lc.nearestDistPct, 1)}% away.`
+            : 'Crowding is balanced today, neither side is more exposed than the other.';
+          const monthlyTxt = lc.monthly
+            ? `This crowding direction has been dominant in ${lc.monthly.pct}% of the last ${lc.monthly.count} logged reading(s).`
+            : 'Not enough logged history yet to say if this crowding direction is new or sustained over time.';
+          liqLines = `${aboveTxt}\n${belowTxt}\n${crowdTxt} ${monthlyTxt}`;
+        }
 
         const dataBlock = `PRICE: $${fmt(data.price, 0)}
 
@@ -949,6 +969,9 @@ Volume: ${t.volume?.trend || 'N/A'}
 MA Crossover: ${t.maCrossover?.type ? `${t.maCrossover.type} cross, ${t.maCrossover.daysAgo} day(s) ago` : 'none in window'}
 Swing structure: ${t.swingStructure || 'N/A'}
 RSI/Price divergence: ${t.divergence?.type || 'none'}
+
+LIQUIDATION CLUSTERS (Hyperliquid-modeled, BTC-focused - only present if the Liquidation tab was visited this session with BTC focused; if absent, do not mention liquidation clusters at all)
+${liqLines}
 
 PROBABILITY MODEL (frequency-based, NOT a guess)
 ${pm.insufficient ? `Insufficient data (${pm.n || 0} matches) - do not state a probability, say so plainly.` : `${Math.round((pm.probUp || 0) * 100)}% of ${pm.n} historically comparable day(s) (bucket ${pm.bucket}-${(pm.bucket || 0) + 20}) saw BTC higher 7 days later.`}
@@ -985,6 +1008,7 @@ CRITICAL RULES:
 - If a conflict exists between timeframes (short/medium/long-term, or between the regime scorecard's columns), name it explicitly and explain briefly why it might be happening (e.g. crypto-native flows vs. broader macro correlation) rather than just listing both sides.
 - The event calendar (FOMC proximity) is a CONFIDENCE modifier only — it tempers how much weight to put on short-term reads, it is never itself bullish or bearish.
 - If sector rotation shows BTC underperforming Nasdaq, say plainly that this looks like capital rotating away from crypto specifically, not generic risk-off.
+- LIQUIDATION CLUSTERS, if present, belongs INSIDE the Technicals section (never its own heading) as 1-2 extra plain-language sentences: current price, the nearest cluster above and below with their distance in % and modeled probability of being reached within the stated horizon, and today's crowding read. State the historical hit-rate or "not enough data yet" for calibration, and the monthly persistence or "not enough logged history yet", exactly as given - never guess these when the data says they're unavailable. If LIQUIDATION CLUSTERS says "Not available this session", do not mention liquidation clusters at all.
 - For the Geopolitical & Macro Drivers section: use ONLY the headlines listed in TOP HEADLINES, verbatim topic (you may paraphrase the headline briefly, do not invent an event not present in that list). Pick the 3 to 5 with the largest |score|. For each, give the headline's topic in a few words and one sentence on why it plausibly matters for BTC (e.g. risk-off/risk-on transmission, inflation/rate-cut expectations, dollar strength, haven demand) — do not assert a causal price move you weren't given data for. If TOP HEADLINES is empty or says "(none available this cycle)", say plainly that no headline-level detail was available this cycle and do not invent any events.
 
 OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this displays as raw text, not rendered markdown), structured with blank lines between sections exactly like this:
@@ -993,7 +1017,7 @@ OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this di
 
 Sentiment & drivers: [2-3 sentences on composite score, which raw sources are pulling it up or down, and what that implies.]
 
-Technicals: [2-3 sentences on RSI/MAs/Ichimoku/divergence/structure, using the correct RSI interpretation above.]
+Technicals: [2-3 sentences on RSI/MAs/Ichimoku/divergence/structure, using the correct RSI interpretation above. If LIQUIDATION CLUSTERS data is present, add 1-2 more sentences folding in the nearby modeled clusters, their distance/probability, and today's crowding read - in plain everyday language, not jargon.]
 
 Geopolitical & Macro Drivers: [3 to 5 bullet-style lines (use a leading dash, not a markdown bullet), each naming one headline topic from TOP HEADLINES and one sentence on its plausible market impact. If none available, say so plainly in one sentence instead of a list.]
 
