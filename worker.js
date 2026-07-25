@@ -623,7 +623,7 @@ RULES:
     if (url.pathname === '/history' && request.method === 'GET') {
       try {
         const { results } = await env.DB.prepare(
-          'SELECT ts, score, technical_score as technicalScore, btc_price as btc, gold_regime as goldRegime, sources_json FROM history ORDER BY ts DESC LIMIT 500'
+          'SELECT ts, score, technical_score as technicalScore, btc_price as btc, gold_regime as goldRegime, sources_json, regime_mag as regimeMag, bottom_score as bottomScore FROM history ORDER BY ts DESC LIMIT 500'
         ).all();
         return new Response(JSON.stringify({ history: results.reverse() }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
@@ -634,13 +634,21 @@ RULES:
     // ---- POST /history — log one snapshot point (sentiment, technical, price, sources) ----
     if (url.pathname === '/history' && request.method === 'POST') {
       try {
-        const { score, technicalScore, btcPrice, sources, goldRegime } = await request.json();
+        // FIX: regimeMag was already being sent by the client every cycle (see
+        // window.__lastRegimeScorecard?.overallMag in the POST body) but this
+        // handler never destructured or stored it — no regime_mag column
+        // existed either. Every read of row.regimeMag downstream (the
+        // self-backtest, the conviction-average-over-window helper) has
+        // therefore always seen null/undefined, silently. bottomScore is new:
+        // needed so the Market Bottom Signal can appear in the Dashboard's
+        // 24h-ago comparison alongside Sentiment/Technical/Combined/Scorecard.
+        const { score, technicalScore, btcPrice, sources, goldRegime, regimeMag, bottomScore } = await request.json();
         if (typeof score !== 'number') {
           return new Response(JSON.stringify({ error: 'score (number) requis' }), { status: 400, headers: corsHeaders });
         }
         const now = Date.now();
-        await env.DB.prepare('INSERT INTO history (ts, score, technical_score, btc_price, gold_regime, sources_json) VALUES (?, ?, ?, ?, ?, ?)')
-          .bind(now, score, typeof technicalScore === 'number' ? technicalScore : null, btcPrice ?? null, goldRegime ?? null, sources ? JSON.stringify(sources) : null).run();
+        await env.DB.prepare('INSERT INTO history (ts, score, technical_score, btc_price, gold_regime, sources_json, regime_mag, bottom_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(now, score, typeof technicalScore === 'number' ? technicalScore : null, btcPrice ?? null, goldRegime ?? null, sources ? JSON.stringify(sources) : null, typeof regimeMag === 'number' ? regimeMag : null, typeof bottomScore === 'number' ? bottomScore : null).run();
         await env.DB.prepare(
           'DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY ts DESC LIMIT 500)'
         ).run();
