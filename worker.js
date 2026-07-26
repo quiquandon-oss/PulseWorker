@@ -623,7 +623,7 @@ RULES:
     if (url.pathname === '/history' && request.method === 'GET') {
       try {
         const { results } = await env.DB.prepare(
-          'SELECT ts, score, technical_score as technicalScore, btc_price as btc, gold_regime as goldRegime, sources_json, regime_mag as regimeMag, bottom_score as bottomScore FROM history ORDER BY ts DESC LIMIT 500'
+          'SELECT ts, score, technical_score as technicalScore, btc_price as btc, gold_regime as goldRegime, sources_json, regime_mag as regimeMag, bottom_score as bottomScore, global_mcap as globalMcap FROM history ORDER BY ts DESC LIMIT 500'
         ).all();
         return new Response(JSON.stringify({ history: results.reverse() }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
@@ -642,13 +642,20 @@ RULES:
         // therefore always seen null/undefined, silently. bottomScore is new:
         // needed so the Market Bottom Signal can appear in the Dashboard's
         // 24h-ago comparison alongside Sentiment/Technical/Combined/Scorecard.
-        const { score, technicalScore, btcPrice, sources, goldRegime, regimeMag, bottomScore } = await request.json();
+        // globalMcap: the raw total crypto market cap in USD (from CoinGecko's
+        // free /global endpoint, which the composite already calls every
+        // cycle for its 24h-change score — this is the SAME call, just also
+        // keeping the absolute dollar figure it was discarding before).
+        // History starts accumulating from whenever this first gets written —
+        // CoinGecko's actual historical total-market-cap chart endpoint is
+        // Pro-API-only, so there's no way to backfill real data before today.
+        const { score, technicalScore, btcPrice, sources, goldRegime, regimeMag, bottomScore, globalMcap } = await request.json();
         if (typeof score !== 'number') {
           return new Response(JSON.stringify({ error: 'score (number) requis' }), { status: 400, headers: corsHeaders });
         }
         const now = Date.now();
-        await env.DB.prepare('INSERT INTO history (ts, score, technical_score, btc_price, gold_regime, sources_json, regime_mag, bottom_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-          .bind(now, score, typeof technicalScore === 'number' ? technicalScore : null, btcPrice ?? null, goldRegime ?? null, sources ? JSON.stringify(sources) : null, typeof regimeMag === 'number' ? regimeMag : null, typeof bottomScore === 'number' ? bottomScore : null).run();
+        await env.DB.prepare('INSERT INTO history (ts, score, technical_score, btc_price, gold_regime, sources_json, regime_mag, bottom_score, global_mcap) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(now, score, typeof technicalScore === 'number' ? technicalScore : null, btcPrice ?? null, goldRegime ?? null, sources ? JSON.stringify(sources) : null, typeof regimeMag === 'number' ? regimeMag : null, typeof bottomScore === 'number' ? bottomScore : null, typeof globalMcap === 'number' ? globalMcap : null).run();
         await env.DB.prepare(
           'DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY ts DESC LIMIT 500)'
         ).run();
