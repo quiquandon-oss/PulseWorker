@@ -512,6 +512,41 @@ export default {
       }
     }
 
+    // ---- GET /stock-proxy — "9 Magnificent" (Broadcom, Apple, Tesla,
+    // Microsoft, Meta, Alphabet, Amazon, Nvidia, SpaceX), fetched server-side
+    // via Yahoo Finance's v8/finance/chart endpoint. This is an unofficial,
+    // undocumented API — no CORS header for arbitrary browser origins
+    // either way, hence the proxy — and it has a documented history of
+    // access changes (the older v7/finance/quote endpoint was locked down
+    // in late 2024/2025; v8/chart is the current working replacement). No
+    // evidence found of the Binance/Bybit-style hard geoblock against cloud
+    // IPs specifically, but this is inherently less stable than a real
+    // published API and may need re-checking if it stops working. ----
+    const NINE_MAG_SYMBOLS = ['NVDA', 'AVGO', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'SPCX'];
+    if (url.pathname === '/stock-proxy' && request.method === 'GET') {
+      try {
+        const results = await Promise.allSettled(NINE_MAG_SYMBOLS.map(async (sym) => {
+          const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1d`, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+          });
+          if (!res.ok) throw new Error(sym + ' ' + res.status);
+          const json = await res.json();
+          const meta = json?.chart?.result?.[0]?.meta;
+          if (!meta || meta.regularMarketPrice == null) throw new Error(sym + ' no price data');
+          return { sym, price: meta.regularMarketPrice, prevClose: meta.previousClose ?? meta.chartPreviousClose, marketCap: meta.marketCap ?? null };
+        }));
+        const quotes = {};
+        results.forEach((r, i) => {
+          const sym = NINE_MAG_SYMBOLS[i];
+          if (r.status === 'fulfilled') quotes[sym] = { price: r.value.price, prevClose: r.value.prevClose, marketCap: r.value.marketCap };
+          else quotes[sym] = { error: r.reason?.message || String(r.reason) };
+        });
+        return new Response(JSON.stringify({ quotes, ts: Date.now() }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
+      }
+    }
+
     // ---- POST /whale-analysis — LLM narration of the whale transfers
     // CryptoPulse already fetched and classified (exchange outflow/inflow),
     // plus any concentration/bidirectional/high-volume flags CryptoPulse
