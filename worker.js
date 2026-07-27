@@ -512,6 +512,28 @@ export default {
       }
     }
 
+    // ---- GET /longshort-proxy — Binance's futures long/short account ratio,
+    // fetched server-side. CryptoPulse's client used to call
+    // fapi.binance.com directly from the browser (same as srcFundingRate did
+    // before it was migrated to Hyperliquid) — confirmed via Binance's own
+    // developer community forum that this exact class of endpoint
+    // intermittently/fully blocks cross-origin requests from arbitrary
+    // browser origins with no Access-Control-Allow-Origin header, which is
+    // exactly why 'longshort' was silently absent from every composite
+    // cycle's sources_json despite being a registered source. A Worker fetch
+    // isn't subject to browser CORS at all, so this sidesteps the problem
+    // entirely rather than depending on Binance ever fixing it. ----
+    if (url.pathname === '/longshort-proxy' && request.method === 'GET') {
+      try {
+        const res = await fetch('https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=BTCUSDT&period=1h&limit=1');
+        if (!res.ok) throw new Error('Binance long/short ' + res.status);
+        const json = await res.json();
+        return new Response(JSON.stringify(json), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
+      }
+    }
+
     // ---- POST /whale-analysis — LLM narration of the whale transfers
     // CryptoPulse already fetched and classified (exchange outflow/inflow),
     // plus any concentration/bidirectional/high-volume flags CryptoPulse
