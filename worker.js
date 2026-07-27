@@ -42,7 +42,7 @@ function rsi(closes, period, endIndex) {
 // data (proven reliable from a real browser) instead of depending on
 // Cloudflare Workers reaching CoinGecko, which is rate-limited (429) on a
 // shared-IP basis for Workers traffic — not fixable with headers/params.
-async function evaluateTechnicalsFromCloses(env, closes) {
+async function evaluateTechnicalsFromCloses(env, closes, extended) {
   if (closes.length < 200) throw new Error('Historique insuffisant (' + closes.length + ' points)');
   const last = closes.length - 1;
   const currentPrice = closes[last];
@@ -53,7 +53,7 @@ async function evaluateTechnicalsFromCloses(env, closes) {
   const ma200 = sma(closes, 200, last);
   const rsi14 = rsi(closes, 14, last);
 
-  const snapshot = `Prix BTC actuel : $${currentPrice.toFixed(0)}
+  let snapshot = `Prix BTC actuel : $${currentPrice.toFixed(0)}
 Tenkan (9j) : $${tenkan?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > tenkan ? 'au-dessus' : 'en dessous'}
 Kijun (26j) : $${kijun?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > kijun ? 'au-dessus' : 'en dessous'}
 MM50 : $${ma50?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > ma50 ? 'au-dessus' : 'en dessous'}
@@ -61,19 +61,60 @@ MM100 : $${ma100?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > ma100 ? 'au-des
 MM200 : $${ma200?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > ma200 ? 'au-dessus' : 'en dessous'}
 RSI(14) : ${rsi14?.toFixed(1) ?? 'N/A'} (>50 = momentum acheteur, <50 = vendeur)`;
 
-  const prompt = `Tu es un analyste technique crypto façon "Foufi" (analyse Ichimoku/moyennes mobiles/RSI).
-Voici l'état technique actuel du Bitcoin :
+  // Extended indicators — pre-computed client-side by CryptoPulse (not
+  // recomputed here, avoiding duplicate logic in two languages). Optional:
+  // gracefully omitted from the prompt if not supplied (e.g. an older
+  // client, or the GET fallback trigger path).
+  if (extended) {
+    const fmtPct = (p) => {
+      if (!p || p.prob == null) return 'donnée insuffisante';
+      const pct = Math.round(p.prob * 100);
+      const base = p.baseline != null ? Math.round(p.baseline * 100) : null;
+      return `${pct}%${base != null ? ` (référence ${base}%)` : ''}, n=${p.n}`;
+    };
+    const lines = [];
+    if (extended.macd && extended.macd.histogram != null) {
+      lines.push(`MACD : histogramme ${extended.macd.histogram > 0 ? 'positif' : 'négatif'} (${extended.macd.histogram.toFixed(0)})`);
+    }
+    if (extended.bollinger && extended.bollinger.upper != null) {
+      const pctB = (currentPrice - extended.bollinger.lower) / (extended.bollinger.upper - extended.bollinger.lower);
+      lines.push(`Bandes de Bollinger : prix à ${Math.round(pctB * 100)}% de la bande (0%=basse, 100%=haute)`);
+    }
+    if (extended.obv && extended.obv.confirming != null) {
+      lines.push(`OBV (60j) : ${extended.obv.confirming ? 'confirme' : 'diverge de'} la tendance des prix`);
+    }
+    if (extended.kumoTwist && extended.kumoTwist.type) {
+      lines.push(`Kumo Twist : croisement ${extended.kumoTwist.type === 'bullish' ? 'haussier' : 'baissier'} (${extended.kumoTwist.daysAgo}j${extended.kumoTwist.daysAgo < 0 ? ', à venir' : ' passé'})`);
+    }
+    if (extended.probRsiExtreme) {
+      if (extended.probRsiExtreme.overbought?.n >= 5) lines.push(`Historique : après RSI>70, prix a reculé ${fmtPct(extended.probRsiExtreme.overbought)}`);
+      if (extended.probRsiExtreme.oversold?.n >= 5) lines.push(`Historique : après RSI<30, prix a monté ${fmtPct(extended.probRsiExtreme.oversold)}`);
+    }
+    if (extended.probSwing) {
+      if (extended.probSwing.uptrend?.n >= 5) lines.push(`Historique : structure haussière → hausse 14j ${fmtPct(extended.probSwing.uptrend)}`);
+      if (extended.probSwing.downtrend?.n >= 5) lines.push(`Historique : structure baissière → hausse 14j ${fmtPct(extended.probSwing.downtrend)}`);
+    }
+    if (lines.length) snapshot += `\n${lines.join('\n')}`;
+  }
+
+  const prompt = `Tu es un analyste technique crypto façon "Foufi" (analyse Ichimoku/moyennes mobiles/RSI/MACD/Bollinger/OBV).
+Voici l'état technique actuel du Bitcoin, y compris des probabilités historiques réelles calculées
+sur les 365 derniers jours (avec leur référence de base et leur taille d'échantillon n — un petit n
+n'est pas fiable statistiquement, mentionne-le si n<10) :
 
 ${snapshot}
 
-Donne une évaluation courte (3-4 phrases max) dans ce style : identifie si le prix tient
-les niveaux clés (Tenkan/Kijun/MM), commente le RSI par rapport au seuil 50, et conclus sur
-un biais général (haussier/baissier/neutre). Termine ta réponse par une ligne exacte au format :
+Donne une évaluation courte (4-5 phrases max) dans ce style : identifie si le prix tient
+les niveaux clés (Tenkan/Kijun/MM), commente le RSI et le MACD, mentionne les probabilités
+historiques SEULEMENT si elles ont un échantillon décent (n>=10) et un écart net par rapport à
+leur référence de base, et conclus sur un biais général (haussier/baissier/neutre). Ne présente
+jamais une probabilité à faible échantillon comme une certitude. Termine ta réponse par une ligne
+exacte au format :
 SCORE: X (où X est un entier de -2 très baissier à +2 très haussier).`;
 
   const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: 400,
+    max_tokens: 450,
   });
   const text = typeof result.response === 'string' ? result.response : JSON.stringify(result.response || '');
   const scoreMatch = text.match(/SCORE:\s*(-?\d+)/);
@@ -910,11 +951,11 @@ RULES:
     // ---- POST /run-technical-eval — reliable path: CryptoPulse supplies its own closes[] ----
     if (url.pathname === '/run-technical-eval' && request.method === 'POST') {
       try {
-        const { closes } = await request.json();
+        const { closes, extended } = await request.json();
         if (!Array.isArray(closes) || closes.length < 200) {
           return new Response(JSON.stringify({ error: 'closes[] (200+ points) requis' }), { status: 400, headers: corsHeaders });
         }
-        await evaluateTechnicalsFromCloses(env, closes);
+        await evaluateTechnicalsFromCloses(env, closes, extended);
         const { results } = await env.DB.prepare('SELECT ts, evaluation, score FROM technical_eval ORDER BY ts DESC LIMIT 1').all();
         return new Response(JSON.stringify({ latest: results[0] || null }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
