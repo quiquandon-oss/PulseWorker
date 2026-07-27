@@ -526,19 +526,26 @@ export default {
     if (url.pathname === '/stock-proxy' && request.method === 'GET') {
       try {
         const results = await Promise.allSettled(NINE_MAG_SYMBOLS.map(async (sym) => {
-          const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1d`, {
+          // range=1mo (not 1d) — same call now serves both the 24h card AND
+          // the BTC-comparison chart, rather than a second endpoint for the
+          // same underlying data.
+          const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1mo`, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
           });
           if (!res.ok) throw new Error(sym + ' ' + res.status);
           const json = await res.json();
-          const meta = json?.chart?.result?.[0]?.meta;
+          const result = json?.chart?.result?.[0];
+          const meta = result?.meta;
           if (!meta || meta.regularMarketPrice == null) throw new Error(sym + ' no price data');
-          return { sym, price: meta.regularMarketPrice, prevClose: meta.previousClose ?? meta.chartPreviousClose, marketCap: meta.marketCap ?? null };
+          const timestamps = result.timestamp || [];
+          const closes = result.indicators?.quote?.[0]?.close || [];
+          const series = timestamps.map((t, i) => ({ ts: t * 1000, close: closes[i] })).filter((p) => p.close != null);
+          return { sym, price: meta.regularMarketPrice, prevClose: meta.previousClose ?? meta.chartPreviousClose, marketCap: meta.marketCap ?? null, series };
         }));
         const quotes = {};
         results.forEach((r, i) => {
           const sym = NINE_MAG_SYMBOLS[i];
-          if (r.status === 'fulfilled') quotes[sym] = { price: r.value.price, prevClose: r.value.prevClose, marketCap: r.value.marketCap };
+          if (r.status === 'fulfilled') quotes[sym] = { price: r.value.price, prevClose: r.value.prevClose, marketCap: r.value.marketCap, series: r.value.series };
           else quotes[sym] = { error: r.reason?.message || String(r.reason) };
         });
         return new Response(JSON.stringify({ quotes, ts: Date.now() }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
