@@ -43,7 +43,7 @@ function rsi(closes, period, endIndex) {
 // Cloudflare Workers reaching CoinGecko, which is rate-limited (429) on a
 // shared-IP basis for Workers traffic — not fixable with headers/params.
 async function evaluateTechnicalsFromCloses(env, closes, extended) {
-  if (closes.length < 200) throw new Error('Historique insuffisant (' + closes.length + ' points)');
+  if (closes.length < 200) throw new Error('Insufficient history (' + closes.length + ' points)');
   const last = closes.length - 1;
   const currentPrice = closes[last];
   const tenkan = ichimokuLine(closes, closes, 9, last);
@@ -53,13 +53,13 @@ async function evaluateTechnicalsFromCloses(env, closes, extended) {
   const ma200 = sma(closes, 200, last);
   const rsi14 = rsi(closes, 14, last);
 
-  let snapshot = `Prix BTC actuel : $${currentPrice.toFixed(0)}
-Tenkan (9j) : $${tenkan?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > tenkan ? 'au-dessus' : 'en dessous'}
-Kijun (26j) : $${kijun?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > kijun ? 'au-dessus' : 'en dessous'}
-MM50 : $${ma50?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > ma50 ? 'au-dessus' : 'en dessous'}
-MM100 : $${ma100?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > ma100 ? 'au-dessus' : 'en dessous'}
-MM200 : $${ma200?.toFixed(0) ?? 'N/A'} — prix ${currentPrice > ma200 ? 'au-dessus' : 'en dessous'}
-RSI(14) : ${rsi14?.toFixed(1) ?? 'N/A'} (>50 = momentum acheteur, <50 = vendeur)`;
+  let snapshot = `Current BTC price: $${currentPrice.toFixed(0)}
+Tenkan (9d): $${tenkan?.toFixed(0) ?? 'N/A'} — price ${currentPrice > tenkan ? 'above' : 'below'}
+Kijun (26d): $${kijun?.toFixed(0) ?? 'N/A'} — price ${currentPrice > kijun ? 'above' : 'below'}
+MA50: $${ma50?.toFixed(0) ?? 'N/A'} — price ${currentPrice > ma50 ? 'above' : 'below'}
+MA100: $${ma100?.toFixed(0) ?? 'N/A'} — price ${currentPrice > ma100 ? 'above' : 'below'}
+MA200: $${ma200?.toFixed(0) ?? 'N/A'} — price ${currentPrice > ma200 ? 'above' : 'below'}
+RSI(14): ${rsi14?.toFixed(1) ?? 'N/A'} (>50 = buyer momentum, <50 = seller momentum)`;
 
   // Extended indicators — pre-computed client-side by CryptoPulse (not
   // recomputed here, avoiding duplicate logic in two languages). Optional:
@@ -67,50 +67,49 @@ RSI(14) : ${rsi14?.toFixed(1) ?? 'N/A'} (>50 = momentum acheteur, <50 = vendeur)
   // client, or the GET fallback trigger path).
   if (extended) {
     const fmtPct = (p) => {
-      if (!p || p.prob == null) return 'donnée insuffisante';
+      if (!p || p.prob == null) return 'insufficient data';
       const pct = Math.round(p.prob * 100);
       const base = p.baseline != null ? Math.round(p.baseline * 100) : null;
-      return `${pct}%${base != null ? ` (référence ${base}%)` : ''}, n=${p.n}`;
+      return `${pct}%${base != null ? ` (baseline ${base}%)` : ''}, n=${p.n}`;
     };
     const lines = [];
     if (extended.macd && extended.macd.histogram != null) {
-      lines.push(`MACD : histogramme ${extended.macd.histogram > 0 ? 'positif' : 'négatif'} (${extended.macd.histogram.toFixed(0)})`);
+      lines.push(`MACD: histogram ${extended.macd.histogram > 0 ? 'positive' : 'negative'} (${extended.macd.histogram.toFixed(0)})`);
     }
     if (extended.bollinger && extended.bollinger.upper != null) {
       const pctB = (currentPrice - extended.bollinger.lower) / (extended.bollinger.upper - extended.bollinger.lower);
-      lines.push(`Bandes de Bollinger : prix à ${Math.round(pctB * 100)}% de la bande (0%=basse, 100%=haute)`);
+      lines.push(`Bollinger Bands: price at ${Math.round(pctB * 100)}% of the band (0%=lower, 100%=upper)`);
     }
     if (extended.obv && extended.obv.confirming != null) {
-      lines.push(`OBV (60j) : ${extended.obv.confirming ? 'confirme' : 'diverge de'} la tendance des prix`);
+      lines.push(`OBV (60d): ${extended.obv.confirming ? 'confirms' : 'diverges from'} the price trend`);
     }
     if (extended.kumoTwist && extended.kumoTwist.type) {
-      lines.push(`Kumo Twist : croisement ${extended.kumoTwist.type === 'bullish' ? 'haussier' : 'baissier'} (${extended.kumoTwist.daysAgo}j${extended.kumoTwist.daysAgo < 0 ? ', à venir' : ' passé'})`);
+      lines.push(`Kumo Twist: ${extended.kumoTwist.type} crossover (${extended.kumoTwist.daysAgo}d${extended.kumoTwist.daysAgo < 0 ? ', upcoming' : ' ago'})`);
     }
     if (extended.probRsiExtreme) {
-      if (extended.probRsiExtreme.overbought?.n >= 5) lines.push(`Historique : après RSI>70, prix a reculé ${fmtPct(extended.probRsiExtreme.overbought)}`);
-      if (extended.probRsiExtreme.oversold?.n >= 5) lines.push(`Historique : après RSI<30, prix a monté ${fmtPct(extended.probRsiExtreme.oversold)}`);
+      if (extended.probRsiExtreme.overbought?.n >= 5) lines.push(`History: after RSI>70, price fell back ${fmtPct(extended.probRsiExtreme.overbought)}`);
+      if (extended.probRsiExtreme.oversold?.n >= 5) lines.push(`History: after RSI<30, price rose ${fmtPct(extended.probRsiExtreme.oversold)}`);
     }
     if (extended.probSwing) {
-      if (extended.probSwing.uptrend?.n >= 5) lines.push(`Historique : structure haussière → hausse 14j ${fmtPct(extended.probSwing.uptrend)}`);
-      if (extended.probSwing.downtrend?.n >= 5) lines.push(`Historique : structure baissière → hausse 14j ${fmtPct(extended.probSwing.downtrend)}`);
+      if (extended.probSwing.uptrend?.n >= 5) lines.push(`History: uptrend structure → up in 14d ${fmtPct(extended.probSwing.uptrend)}`);
+      if (extended.probSwing.downtrend?.n >= 5) lines.push(`History: downtrend structure → up in 14d ${fmtPct(extended.probSwing.downtrend)}`);
     }
     if (lines.length) snapshot += `\n${lines.join('\n')}`;
   }
 
-  const prompt = `Tu es un analyste technique crypto façon "Foufi" (analyse Ichimoku/moyennes mobiles/RSI/MACD/Bollinger/OBV).
-Voici l'état technique actuel du Bitcoin, y compris des probabilités historiques réelles calculées
-sur les 365 derniers jours (avec leur référence de base et leur taille d'échantillon n — un petit n
-n'est pas fiable statistiquement, mentionne-le si n<10) :
+  const prompt = `You are a crypto technical analyst in the "Foufi" style (Ichimoku/moving averages/RSI/MACD/Bollinger/OBV analysis).
+Here is Bitcoin's current technical state, including real historical probabilities calculated
+over the last 365 days (with their baseline reference and sample size n — a small n
+is not statistically reliable, mention this if n<10):
 
 ${snapshot}
 
-Donne une évaluation courte (4-5 phrases max) dans ce style : identifie si le prix tient
-les niveaux clés (Tenkan/Kijun/MM), commente le RSI et le MACD, mentionne les probabilités
-historiques SEULEMENT si elles ont un échantillon décent (n>=10) et un écart net par rapport à
-leur référence de base, et conclus sur un biais général (haussier/baissier/neutre). Ne présente
-jamais une probabilité à faible échantillon comme une certitude. Termine ta réponse par une ligne
-exacte au format :
-SCORE: X (où X est un entier de -2 très baissier à +2 très haussier).`;
+Give a short evaluation (4-5 sentences max) in this style: identify whether price is holding
+key levels (Tenkan/Kijun/MA), comment on RSI and MACD, mention the historical probabilities
+ONLY if they have a decent sample (n>=10) and a clear gap from their baseline, and conclude with
+an overall bias (bullish/bearish/neutral). Never present a low-sample probability as a certainty.
+End your response with an exact line in this format:
+SCORE: X (where X is an integer from -2 very bearish to +2 very bullish).`;
 
   const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
     messages: [{ role: 'user', content: prompt }],
