@@ -1223,6 +1223,81 @@ ${dataBlock}`;
       }
     }
 
+    // ---- POST /narrative-analysis — separate from /trader-analysis by
+    // design (different menu, different question: not "what's BTC doing"
+    // but "what crypto-market theme is dominant right now, and how exposed
+    // is my specific portfolio to it"). CryptoPulse computes the category
+    // rankings and portfolio exposure deterministically client-side (same
+    // architecture principle as everywhere else in this app — this route
+    // only narrates, never invents a ranking or a connection the data
+    // doesn't support). Uses gpt-oss-120b rather than the fast 8B model
+    // used elsewhere in this Worker — an explicit experiment for this
+    // specific reasoning-heavy route, not a swap for the faster/cheaper
+    // routes (Whale/Liquidation narration, the alerts cron) where latency
+    // matters more and the reasoning demands are lighter. ----
+    if (url.pathname === '/narrative-analysis' && request.method === 'POST') {
+      try {
+        const data = await request.json();
+        const cats = data.categories || [];
+        const exposure = data.portfolioExposure || [];
+        const fmt = (v, d = 1) => (v == null ? 'N/A' : v.toFixed(d));
+
+        const catLines = cats.length
+          ? cats.map(c => `  "${c.name}": ${c.changePct >= 0 ? '+' : ''}${fmt(c.changePct)}% (24h market cap change)`).join('\n')
+          : null;
+
+        const exposureLines = exposure.length
+          ? exposure.map(e => {
+              const linkedTxt = (e.linked || []).length
+                ? (e.linked || []).map(l => `"${l.name}" (${l.changePct >= 0 ? '+' : ''}${fmt(l.changePct)}%)`).join(', ')
+                : 'no currently-notable category linked';
+              return `  ${e.sym}: ${fmt(e.weight)}% of portfolio, linked to: ${linkedTxt}`;
+            }).join('\n')
+          : null;
+
+        const dataBlock = `CATEGORY MOVEMENTS (CoinGecko sector-level market cap change, ranked by move size — only categories moving beyond a +/-5% threshold are included here; this list is ALREADY filtered and ranked by CryptoPulse, do not re-rank or add categories not listed)
+${catLines || 'None — no category crossed the +/-5% threshold in the last 24h.'}
+
+PORTFOLIO EXPOSURE (the user's actual holdings, weighted by position size, and which of the above categories — if any — each coin is linked to; this mapping was already determined by CryptoPulse, do not invent a different linkage)
+${exposureLines || 'No portfolio data available this session.'}`;
+
+        const prompt = `You are a crypto portfolio analyst identifying whether there is a dominant market narrative right now, and what it means specifically for this user's own holdings — not the market in general. Every number below was already computed by CryptoPulse; never invent, re-rank, or re-link anything not explicitly given.
+
+CRITICAL RULES:
+- If CATEGORY MOVEMENTS says "None," you MUST say plainly that no category crossed the significance threshold today and there is no dominant narrative to report right now — do NOT invent one anyway. A quiet market is a real, useful finding, not a failure to find something.
+- Only discuss categories that are explicitly listed. Do not mention any crypto sector, theme, or story not present in the data above, even if you believe it is generally relevant — you do not have live information about today specifically, only what is given here.
+- For each listed category, only claim a connection to a specific coin (BTC/ETH/SOL/LINK/HYPE) if that coin is explicitly listed as linked to it in PORTFOLIO EXPOSURE. Never assert a link the data doesn't show.
+- Distinguish explicitly between what a 24h category move might mean SHORT-TERM (the next few days — likely just momentum/rotation) versus MEDIUM-TERM (weeks — whether this looks like the start of a sustained theme or a one-off spike) — you do not have enough information here to say anything reliable about LONG-TERM (months+), so do not attempt to.
+- Never state or imply a specific future price target or a guaranteed outcome. This is a read on current positioning and exposure, not a prediction.
+- If PORTFOLIO EXPOSURE says no data is available, do not discuss portfolio-specific impact at all — only discuss the category movements themselves, if any.
+
+OUTPUT FORMAT — plain text, no markdown symbols, structured with blank lines between sections exactly like this:
+
+[One or two sentence summary: is there a dominant narrative right now or not, and if so, the single biggest one.]
+
+Category moves: [2-4 sentences on the notable category movements, if any, or one sentence stating plainly that none crossed the threshold today.]
+
+Your portfolio's exposure: [2-4 sentences on which of the user's specific holdings are linked to the notable categories, their weight in the portfolio, and whether this reads as bullish or bearish for those specific positions. If no categories were notable, say plainly that there is nothing specific to flag for the portfolio right now.]
+
+Short vs medium term: [1-2 sentences distinguishing likely short-term (days) noise/momentum from whether this looks like it could become a sustained medium-term (weeks) theme, or say there isn't enough information to distinguish these if that's the honest read.]
+
+DATA:
+${dataBlock}`;
+
+        const result = await env.AI.run('@cf/openai/gpt-oss-120b', {
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 500,
+        });
+        const text = typeof result.response === 'string' ? result.response : JSON.stringify(result.response || '');
+        if (!text) throw new Error('Empty model response');
+        return new Response(JSON.stringify({ analysis: text.trim(), ts: Date.now() }), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
     // ---- Anything else: not a route this Worker serves ----
     return new Response(JSON.stringify({ error: 'Not found. This Worker serves CryptoPulse only.' }), { status: 404, headers: corsHeaders });
   },
