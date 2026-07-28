@@ -1331,37 +1331,45 @@ ${dataBlock}`;
           ? portfolio.map((p) => `  ${p.sym}: ${fmt(p.weight)}% of portfolio`).join('\n')
           : '  (no portfolio data provided)';
 
-        const prompt = `You are a crypto portfolio analyst. Using your own knowledge of current and recent crypto market narratives and trends, identify the 2-3 most significant themes currently shaping the crypto market at a MEDIUM-TERM (weeks to a few months) and LONG-TERM (6+ months) horizon.
+        const prompt = `You are a crypto portfolio analyst. Using your own knowledge of current and recent crypto market narratives and trends, identify exactly the 2-3 most significant themes currently shaping the crypto market at a MEDIUM-TERM (weeks to a few months) and LONG-TERM (6+ months) horizon.
 
-For each narrative you identify:
-- Briefly explain what it is and why it's significant right now
-- Name which crypto sectors or ecosystems it primarily touches
-
-Then, using the user's ACTUAL portfolio below (real position weights — this is factual, not a hypothetical), assess for EACH of their specific holdings whether each narrative reads as bullish, bearish, or genuinely neutral/not applicable — be honest when a holding has little real connection to a narrative rather than forcing a link that isn't there.
-
-USER'S PORTFOLIO (answer specifically about these holdings, not the market in general):
+USER'S PORTFOLIO (answer specifically about these holdings, not the market in general — this is factual, not a hypothetical):
 ${portfolioLines}
 
 RULES:
 - Never state or imply a specific future price target or a guaranteed outcome — this is a positioning read, not a forecast.
-- Explicitly separate medium-term (weeks to a few months) commentary from long-term (6+ months) commentary — these can genuinely differ, and conflating them would be misleading.
 - If your knowledge of very recent events might be incomplete or outdated, say so plainly rather than presenting something uncertain as settled fact.
-- Be concise and well-organized rather than exhaustive — a focused, useful read beats an encyclopedic one.
-- Plain text only, no markdown symbols (no #, **, |, >, since this displays as raw text) and no "Narrative 1:"-style labels — write in normal, flowing paragraphs the way an analyst would explain this out loud, not a form.
+- Be honest when a coin has little real connection to a narrative — say so plainly rather than forcing a link that isn't there.
+- Plain text only, no markdown symbols (no #, **, |, >, since this displays as raw text).
+- Follow the exact structure below, in the exact order, with a blank line between every labeled section — do not merge sections into one block of prose.
 
-OUTPUT FORMAT — 4 to 6 short paragraphs (2-4 sentences each), with a blank line between every paragraph so it's easy to read on a small screen:
+OUTPUT FORMAT — follow this structure exactly, once per narrative (2-3 narratives total):
 
-Paragraph 1: state plainly whether there's a dominant medium/long-term theme right now, and name it.
+Narrative 1: [short name for the theme]
+[2-3 sentences: what this narrative is, why it's significant right now, which sectors or ecosystems it touches]
+Impact on your holdings:
+BTC: [one sentence on how this specific narrative affects BTC specifically, medium vs long term if they differ, or state plainly it has little connection]
+ETH: [same]
+SOL: [same]
+LINK: [same]
+HYPE: [same]
 
-Next 1-2 paragraphs: describe each significant narrative as normal prose — what it is, why it's significant now, which sectors it touches — not a label-and-bullet list.
+Narrative 2: [same structure]
+[same structure]
+Impact on your holdings:
+BTC: [same]
+ETH: [same]
+SOL: [same]
+LINK: [same]
+HYPE: [same]
 
-Next paragraph: what this means for the user's specific portfolio, woven into the same prose style — which holdings are affected, how, and whether medium-term and long-term differ for them.
+Narrative 3 (only if genuinely significant, otherwise omit entirely): [same structure]
 
-Final paragraph: a short overall positioning synthesis for the portfolio as a whole.
+Overall positioning: [1-2 sentences synthesizing what this means for the portfolio as a whole across these narratives and timeframes.]
 
-After all paragraphs, on its own final line with absolutely nothing else on that line, output exactly this format (valid JSON, one line, no trailing text after it):
-SCORECARD_JSON: {"BTC":{"medium":"bullish|bearish|neutral","long":"bullish|bearish|neutral"},"ETH":{"medium":"...","long":"..."},"SOL":{"medium":"...","long":"..."},"LINK":{"medium":"...","long":"..."},"HYPE":{"medium":"...","long":"..."}}
-Only ever use the words bullish, bearish, or neutral as values. Neutral is a real, expected, and often correct answer — use it honestly whenever a coin has no genuine connection to the narratives you discussed, rather than forcing a bullish or bearish label onto every coin regardless of relevance.`;
+After all of the above, on its own final line with absolutely nothing else on that line, output exactly this (valid JSON, one line, no trailing text after it, one object per narrative in the SAME order as above, using the SAME narrative names):
+NARRATIVE_JSON: [{"name":"[exact same name as Narrative 1 above]","medium":{"BTC":"bullish|bearish|neutral","ETH":"...","SOL":"...","LINK":"...","HYPE":"..."},"long":{"BTC":"...","ETH":"...","SOL":"...","LINK":"...","HYPE":"..."}},{"name":"[Narrative 2 name]","medium":{...},"long":{...}}]
+Only ever use the words bullish, bearish, or neutral as values. Neutral is a real, expected, and often correct answer for a specific narrative x coin pair — use it honestly whenever a coin has no genuine connection to that particular narrative, rather than forcing a bullish or bearish label onto every coin regardless of relevance.`;
 
         const geminiRes = await fetch(
           // gemini-2.5-flash was confirmed deprecated for new API keys (the
@@ -1386,19 +1394,19 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
         const geminiJson = await geminiRes.json();
         const text = geminiJson?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (!text) throw new Error('Empty or unexpected Gemini response shape: ' + JSON.stringify(geminiJson).slice(0, 300));
-        // Extract the trailing SCORECARD_JSON line separate from the prose.
+        // Extract the trailing NARRATIVE_JSON line separate from the prose.
         // If it's missing or malformed, still return the narrative - never
         // let a formatting hiccup break the whole response.
         let narrative = text.trim();
-        let scorecard = null;
-        const scorecardMatch = narrative.match(/SCORECARD_JSON:\s*(\{[\s\S]*\})\s*$/);
+        let narrativeScores = null;
+        const scorecardMatch = narrative.match(/NARRATIVE_JSON:\s*(\[[\s\S]*\])\s*$/);
         if (scorecardMatch) {
           try {
-            scorecard = JSON.parse(scorecardMatch[1]);
+            narrativeScores = JSON.parse(scorecardMatch[1]);
           } catch (e) { /* malformed - just omit the scorecard, keep the narrative */ }
           narrative = narrative.slice(0, scorecardMatch.index).trim();
         }
-        return new Response(JSON.stringify({ analysis: narrative, scorecard, ts: Date.now() }), {
+        return new Response(JSON.stringify({ analysis: narrative, narrativeScores, ts: Date.now() }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         });
       } catch (err) {
