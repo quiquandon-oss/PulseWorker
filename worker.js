@@ -1344,25 +1344,24 @@ ${portfolioLines}
 
 RULES:
 - Never state or imply a specific future price target or a guaranteed outcome — this is a positioning read, not a forecast.
-- Explicitly separate medium-term (weeks to a few months) commentary from long-term (6+ months) commentary in your answer — these can genuinely differ, and conflating them would be misleading.
+- Explicitly separate medium-term (weeks to a few months) commentary from long-term (6+ months) commentary — these can genuinely differ, and conflating them would be misleading.
 - If your knowledge of very recent events might be incomplete or outdated, say so plainly rather than presenting something uncertain as settled fact.
 - Be concise and well-organized rather than exhaustive — a focused, useful read beats an encyclopedic one.
-- Plain text only, no markdown symbols (no #, **, |, >, since this displays as raw text).
+- Plain text only, no markdown symbols (no #, **, |, >, since this displays as raw text) and no "Narrative 1:"-style labels — write in normal, flowing paragraphs the way an analyst would explain this out loud, not a form.
 
-OUTPUT FORMAT, with blank lines between sections:
+OUTPUT FORMAT — 4 to 6 short paragraphs (2-4 sentences each), with a blank line between every paragraph so it's easy to read on a small screen:
 
-[One or two sentence summary of the dominant medium/long-term theme(s) right now.]
+Paragraph 1: state plainly whether there's a dominant medium/long-term theme right now, and name it.
 
-Narrative 1: [name] - [2-3 sentences: what it is, why it matters, which sectors it touches]
-Portfolio read: [which of the user's holdings this affects and how, medium-term vs long-term if they differ]
+Next 1-2 paragraphs: describe each significant narrative as normal prose — what it is, why it's significant now, which sectors it touches — not a label-and-bullet list.
 
-Narrative 2: [name] - [same structure]
-Portfolio read: [same structure]
+Next paragraph: what this means for the user's specific portfolio, woven into the same prose style — which holdings are affected, how, and whether medium-term and long-term differ for them.
 
-Narrative 3 (if genuinely significant, otherwise omit): [same structure]
-Portfolio read: [same structure]
+Final paragraph: a short overall positioning synthesis for the portfolio as a whole.
 
-Overall positioning note: [1-2 sentences synthesizing what this means for the portfolio as a whole across these timeframes.]`;
+After all paragraphs, on its own final line with absolutely nothing else on that line, output exactly this format (valid JSON, one line, no trailing text after it):
+SCORECARD_JSON: {"BTC":{"medium":"bullish|bearish|neutral","long":"bullish|bearish|neutral"},"ETH":{"medium":"...","long":"..."},"SOL":{"medium":"...","long":"..."},"LINK":{"medium":"...","long":"..."},"HYPE":{"medium":"...","long":"..."}}
+Only ever use the words bullish, bearish, or neutral as values. Neutral is a real, expected, and often correct answer — use it honestly whenever a coin has no genuine connection to the narratives you discussed, rather than forcing a bullish or bearish label onto every coin regardless of relevance.`;
 
         const geminiRes = await fetch(
           // gemini-2.5-flash was confirmed deprecated for new API keys (the
@@ -1387,7 +1386,19 @@ Overall positioning note: [1-2 sentences synthesizing what this means for the po
         const geminiJson = await geminiRes.json();
         const text = geminiJson?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (!text) throw new Error('Empty or unexpected Gemini response shape: ' + JSON.stringify(geminiJson).slice(0, 300));
-        return new Response(JSON.stringify({ analysis: text.trim(), ts: Date.now() }), {
+        // Extract the trailing SCORECARD_JSON line separate from the prose.
+        // If it's missing or malformed, still return the narrative - never
+        // let a formatting hiccup break the whole response.
+        let narrative = text.trim();
+        let scorecard = null;
+        const scorecardMatch = narrative.match(/SCORECARD_JSON:\s*(\{[\s\S]*\})\s*$/);
+        if (scorecardMatch) {
+          try {
+            scorecard = JSON.parse(scorecardMatch[1]);
+          } catch (e) { /* malformed - just omit the scorecard, keep the narrative */ }
+          narrative = narrative.slice(0, scorecardMatch.index).trim();
+        }
+        return new Response(JSON.stringify({ analysis: narrative, scorecard, ts: Date.now() }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         });
       } catch (err) {
