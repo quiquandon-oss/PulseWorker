@@ -526,10 +526,10 @@ export default {
     if (url.pathname === '/stock-proxy' && request.method === 'GET') {
       try {
         const results = await Promise.allSettled(NINE_MAG_SYMBOLS.map(async (sym) => {
-          // range=1mo (not 1d) — same call now serves both the 24h card AND
-          // the BTC-comparison chart, rather than a second endpoint for the
-          // same underlying data.
-          const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1mo`, {
+          // range=3mo — enough history that range-tab switching (7D/30D/90D)
+          // can slice client-side from one fetch, rather than re-calling
+          // this unofficial endpoint on every range switch.
+          const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=3mo`, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
           });
           if (!res.ok) throw new Error(sym + ' ' + res.status);
