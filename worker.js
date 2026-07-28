@@ -1305,6 +1305,88 @@ ${dataBlock}`;
       }
     }
 
+    // ---- POST /gemini-outlook — separate from /narrative-analysis by
+    // design: that route only narrates CryptoPulse's own 24h category data
+    // (deliberately constrained, "never invent anything not given"). This
+    // route calls Gemini directly (the user's own free-tier API key, added
+    // as a Worker secret) and explicitly INVITES it to draw on its own
+    // broader knowledge of current crypto narratives — the whole reason to
+    // use Gemini here is that it isn't limited to a 24h price snapshot the
+    // way the small fast model is. No Google Search grounding for now
+    // (deliberately — grounding's free-tier billing requirement is genuinely
+    // ambiguous per research; base Gemini calls are unambiguously free with
+    // no billing account needed at all). Portfolio composition (real
+    // weights) is the one piece of ground-truth data passed in; the
+    // narrative content itself is Gemini's own synthesis, not something
+    // CryptoPulse computed and is just asking to be narrated. ----
+    if (url.pathname === '/gemini-outlook' && request.method === 'POST') {
+      if (!env.GEMINI_API_KEY) {
+        return new Response(JSON.stringify({ error: 'GEMINI_API_KEY not configured on this Worker' }), { status: 500, headers: corsHeaders });
+      }
+      try {
+        const data = await request.json();
+        const portfolio = data.portfolio || [];
+        const fmt = (v, d = 1) => (v == null ? 'N/A' : v.toFixed(d));
+        const portfolioLines = portfolio.length
+          ? portfolio.map((p) => `  ${p.sym}: ${fmt(p.weight)}% of portfolio`).join('\n')
+          : '  (no portfolio data provided)';
+
+        const prompt = `You are a crypto portfolio analyst. Using your own knowledge of current and recent crypto market narratives and trends, identify the 2-3 most significant themes currently shaping the crypto market at a MEDIUM-TERM (weeks to a few months) and LONG-TERM (6+ months) horizon.
+
+For each narrative you identify:
+- Briefly explain what it is and why it's significant right now
+- Name which crypto sectors or ecosystems it primarily touches
+
+Then, using the user's ACTUAL portfolio below (real position weights — this is factual, not a hypothetical), assess for EACH of their specific holdings whether each narrative reads as bullish, bearish, or genuinely neutral/not applicable — be honest when a holding has little real connection to a narrative rather than forcing a link that isn't there.
+
+USER'S PORTFOLIO (answer specifically about these holdings, not the market in general):
+${portfolioLines}
+
+RULES:
+- Never state or imply a specific future price target or a guaranteed outcome — this is a positioning read, not a forecast.
+- Explicitly separate medium-term (weeks to a few months) commentary from long-term (6+ months) commentary in your answer — these can genuinely differ, and conflating them would be misleading.
+- If your knowledge of very recent events might be incomplete or outdated, say so plainly rather than presenting something uncertain as settled fact.
+- Be concise and well-organized rather than exhaustive — a focused, useful read beats an encyclopedic one.
+- Plain text only, no markdown symbols (no #, **, |, >, since this displays as raw text).
+
+OUTPUT FORMAT, with blank lines between sections:
+
+[One or two sentence summary of the dominant medium/long-term theme(s) right now.]
+
+Narrative 1: [name] - [2-3 sentences: what it is, why it matters, which sectors it touches]
+Portfolio read: [which of the user's holdings this affects and how, medium-term vs long-term if they differ]
+
+Narrative 2: [name] - [same structure]
+Portfolio read: [same structure]
+
+Narrative 3 (if genuinely significant, otherwise omit): [same structure]
+Portfolio read: [same structure]
+
+Overall positioning note: [1-2 sentences synthesizing what this means for the portfolio as a whole across these timeframes.]`;
+
+        const geminiRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+          }
+        );
+        if (!geminiRes.ok) {
+          const errBody = await geminiRes.text();
+          throw new Error(`Gemini API ${geminiRes.status}: ${errBody.slice(0, 300)}`);
+        }
+        const geminiJson = await geminiRes.json();
+        const text = geminiJson?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) throw new Error('Empty or unexpected Gemini response shape: ' + JSON.stringify(geminiJson).slice(0, 300));
+        return new Response(JSON.stringify({ analysis: text.trim(), ts: Date.now() }), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
+      }
+    }
+
     // ---- Anything else: not a route this Worker serves ----
     return new Response(JSON.stringify({ error: 'Not found. This Worker serves CryptoPulse only.' }), { status: 404, headers: corsHeaders });
   },
