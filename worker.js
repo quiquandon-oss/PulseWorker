@@ -1406,6 +1406,19 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
           } catch (e) { /* malformed - just omit the scorecard, keep the narrative */ }
           narrative = narrative.slice(0, scorecardMatch.index).trim();
         }
+        // Deterministic line-break insertion before known structural labels,
+        // regardless of whether Gemini included its own newlines. Relying
+        // purely on the prompt's formatting instructions has failed twice in
+        // real testing (came back as one unbroken block both times) - this
+        // guarantees readable structure independent of the model's
+        // cooperation, rather than trying a third prompt wording.
+        narrative = narrative
+          .replace(/\s*(Narrative\s+\d+:)/g, '\n\n$1')
+          .replace(/\s*(Impact on your holdings:)/gi, '\n$1')
+          .replace(/\s*\b(BTC|ETH|SOL|LINK|HYPE):/g, '\n$1:')
+          .replace(/\s*(Overall positioning:)/gi, '\n\n$1')
+          .replace(/^\n+/, '')
+          .trim();
         return new Response(JSON.stringify({ analysis: narrative, narrativeScores, ts: Date.now() }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         });
