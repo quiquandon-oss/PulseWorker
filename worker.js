@@ -523,6 +523,7 @@ export default {
     // IPs specifically, but this is inherently less stable than a real
     // published API and may need re-checking if it stops working. ----
     const NINE_MAG_SYMBOLS = ['NVDA', 'AVGO', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'SPCX'];
+    const NINE_MAG_NEWS_THRESHOLD_PCT = 3.5; // 24h move magnitude that triggers a targeted news fetch
     if (url.pathname === '/stock-proxy' && request.method === 'GET') {
       // ?granularity=intraday — 5-minute candles over the current/most
       // recent trading session, for the 24H tab specifically. Separate
@@ -567,12 +568,33 @@ export default {
           const prevClose = isIntraday
             ? (meta.previousClose ?? meta.chartPreviousClose)
             : (series.length >= 2 ? series[series.length - 2].close : (meta.previousClose ?? meta.chartPreviousClose));
-          return { sym, price: meta.regularMarketPrice, prevClose, marketCap: meta.marketCap ?? null, series };
+          const pct = prevClose ? ((meta.regularMarketPrice - prevClose) / prevClose) * 100 : null;
+          // Targeted, threshold-triggered news — only for daily-mode
+          // requests (not every 24H-tab click) and only when the move is
+          // large enough to plausibly have a real cause worth explaining.
+          // Reuses the same generic RSS parser already used for the
+          // crypto/macro news-proxy above, against Yahoo's per-ticker feed
+          // (same trusted domain already confirmed working for this Worker,
+          // not a new unvetted source). Non-fatal if it fails — the price
+          // data itself doesn't depend on this succeeding.
+          let headlines = null;
+          if (!isIntraday && pct != null && Math.abs(pct) >= NINE_MAG_NEWS_THRESHOLD_PCT) {
+            try {
+              const newsRes = await fetch(`https://feeds.finance.yahoo.com/rss/2.0/headline?s=${sym}&region=US&lang=en-US`, {
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+              });
+              if (newsRes.ok) {
+                const xml = await newsRes.text();
+                headlines = parseRssTitles(xml, sym).slice(0, 3);
+              }
+            } catch (e) { /* non-fatal — omit headlines, price data still returned */ }
+          }
+          return { sym, price: meta.regularMarketPrice, prevClose, marketCap: meta.marketCap ?? null, series, pct, headlines };
         }));
         const quotes = {};
         results.forEach((r, i) => {
           const sym = NINE_MAG_SYMBOLS[i];
-          if (r.status === 'fulfilled') quotes[sym] = { price: r.value.price, prevClose: r.value.prevClose, marketCap: r.value.marketCap, series: r.value.series };
+          if (r.status === 'fulfilled') quotes[sym] = { price: r.value.price, prevClose: r.value.prevClose, marketCap: r.value.marketCap, series: r.value.series, pct: r.value.pct, headlines: r.value.headlines };
           else quotes[sym] = { error: r.reason?.message || String(r.reason) };
         });
         return new Response(JSON.stringify({ quotes, ts: Date.now() }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -1092,6 +1114,11 @@ Largest transfers:
 ${topTxt || '  (none)'}`;
         }
 
+        const nm = data.nineMagFlags || [];
+        const nineMagLines = nm.length ? nm.map(f =>
+          `  ${f.sym} (${f.name}) moved ${f.pct >= 0 ? '+' : ''}${fmt(f.pct, 1)}% today.${f.headline ? ` Headline found: "${f.headline}".` : ' No headline found for this move.'}`
+        ).join('\n') : null;
+
         const dataBlock = `PRICE: $${fmt(data.price, 0)}
 
 SENTIMENT - composite: ${fmt(data.sentiment?.composite, 0)}/100
@@ -1140,7 +1167,10 @@ TECHNICAL TIMEFRAME ALIGNMENT (50-WEEK EMA — a roughly one-year structural lev
 ${data.technicalAlignment ? `${data.technicalAlignment.label} (price $${fmt(data.technicalAlignment.price, 0)} vs 50wk EMA $${fmt(data.technicalAlignment.ema50, 0)})` : 'Not available this session.'}
 
 TOP HEADLINES (individual news items behind the sentiment sources above, ranked by how strongly each one scored — NOT the same as the aggregate source numbers; these are the specific real headlines driving them)
-${(data.topHeadlines || []).length ? data.topHeadlines.map(h => `  [${h.category}, score ${fmt(h.score, 0)}] "${h.title}"`).join('\n') : '  (none available this cycle)'}`;
+${(data.topHeadlines || []).length ? data.topHeadlines.map(h => `  [${h.category}, score ${fmt(h.score, 0)}] "${h.title}"`).join('\n') : '  (none available this cycle)'}
+
+9 MAGNIFICENT COMPANY MOVES (individual stock moves large enough to trigger a targeted news check — only present when at least one of the 9 tracked companies moved beyond +/-3.5% today; absent means none crossed that threshold this cycle)
+${nineMagLines || 'Not applicable — no individual company move crossed the threshold today.'}`;
 
         const prompt = `You are an experienced crypto trader writing a short, clear BTC market read for someone who wants to understand it in one pass, not decode jargon. You must use the exact numbers given - every value below was already calculated; do not compute, estimate, or invent any number not explicitly provided.
 
@@ -1155,6 +1185,7 @@ CRITICAL RULES:
 - WHALE ACTIVITY, if present, ALSO belongs INSIDE the Technicals section (never its own heading), as 1 extra plain-language sentence on what the large-transfer pattern suggests (e.g. exchange outflows read as accumulation/reduced sell-side supply, inflows as potential distribution, bidirectional flow at the same exchange as repositioning/uncertainty) - state only what the transfer directions and flags actually show, never invent a motive. WHALE ACTIVITY only ever appears when high volatility has genuinely been detected - if it says "Not applicable right now", do not mention whale activity, large transfers, or volatility being high or low anywhere in your output.
 - Key takeaway must explicitly factor in LIQUIDATION CLUSTERS and WHALE ACTIVITY, when present, if either points to a plausible near-term price impact (e.g. a very close and reasonably probable cluster, or whale flow reinforcing or contradicting the rest of the read) - don't force them in if neither adds anything beyond what's already said elsewhere.
 - For the Geopolitical & Macro Drivers section: use ONLY the headlines listed in TOP HEADLINES, verbatim topic (you may paraphrase the headline briefly, do not invent an event not present in that list). Pick the 3 to 5 with the largest |score|. For each, give the headline's topic in a few words and one sentence on why it plausibly matters for BTC (e.g. risk-off/risk-on transmission, inflation/rate-cut expectations, dollar strength, haven demand) — do not assert a causal price move you weren't given data for. If TOP HEADLINES is empty or says "(none available this cycle)", say plainly that no headline-level detail was available this cycle and do not invent any events.
+- 9 MAGNIFICENT COMPANY MOVES gets its own short paragraph, always present in your output (even when nothing was flagged — see below). For each flagged company: state its % move and, if a headline was found, name the likely topic in plain words. Only explain a connection to crypto sentiment as far as the OTHER data in this prompt actually supports it (e.g. the 9 Magnificent composite score in SENTIMENT sources moved the same direction around the same time, or SECTOR ROTATION shows a related pattern) — if nothing else in the data connects it, say plainly that the move is noted but no clear crypto-market linkage is visible in what you were given. Never invent a causal story. If the section says "Not applicable," write one sentence saying no individual company move crossed the threshold today — do not skip this paragraph entirely.
 
 OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this displays as raw text, not rendered markdown), structured with blank lines between sections exactly like this:
 
@@ -1165,6 +1196,8 @@ Sentiment & drivers: [2-3 sentences on composite score, which raw sources are pu
 Technicals: [2-3 sentences on RSI/MAs/Ichimoku/divergence/structure, using the correct RSI interpretation above. If LIQUIDATION CLUSTERS data is present, add 1-2 more sentences folding in the nearby modeled clusters, their distance/probability, and today's crowding read - in plain everyday language, not jargon. If WHALE ACTIVITY is present, add 1 more sentence on what the large-transfer pattern suggests.]
 
 Geopolitical & Macro Drivers: [3 to 5 bullet-style lines (use a leading dash, not a markdown bullet), each naming one headline topic from TOP HEADLINES and one sentence on its plausible market impact. If none available, say so plainly in one sentence instead of a list.]
+
+9 Magnificent Watch: [1-3 sentences on any flagged company moves and their headline, explaining the likely connection to crypto sentiment based on the data given, or noting there's no clear data-supported link. If no companies were flagged this cycle, write one sentence saying no individual company move crossed the threshold today.]
 
 Timeframe breakdown:
 Short-term (7d): [outlook] - [one-line reason, mention the FOMC confidence caveat here if relevant]
