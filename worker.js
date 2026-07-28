@@ -1223,102 +1223,20 @@ ${dataBlock}`;
       }
     }
 
-    // ---- POST /narrative-analysis — separate from /trader-analysis by
-    // design (different menu, different question: not "what's BTC doing"
-    // but "what crypto-market theme is dominant right now, and how exposed
-    // is my specific portfolio to it"). CryptoPulse computes the category
-    // rankings and portfolio exposure deterministically client-side (same
-    // architecture principle as everywhere else in this app — this route
-    // only narrates, never invents a ranking or a connection the data
-    // doesn't support).
-    //
-    // REVERTED from gpt-oss-120b back to the fast Llama model — that was an
-    // explicit experiment (per prior discussion), and real-world testing
-    // showed it failing on two counts: (1) gpt-oss models use OpenAI's
-    // Responses API format via env.AI.run, a completely different response
-    // shape than result.response — the garbled output was this code reading
-    // the wrong field entirely, not the model actually being broken; (2)
-    // even setting that aside, real-world testing showed no return after a
-    // full minute, confirming it's also too slow for this route regardless.
-    // Both problems point the same direction, so reverting rather than
-    // patching the response-parsing for a model that's also proven slow. ----
-    if (url.pathname === '/narrative-analysis' && request.method === 'POST') {
-      try {
-        const data = await request.json();
-        const cats = data.categories || [];
-        const exposure = data.portfolioExposure || [];
-        const fmt = (v, d = 1) => (v == null ? 'N/A' : v.toFixed(d));
-
-        const catLines = cats.length
-          ? cats.map(c => `  "${c.name}": ${c.changePct >= 0 ? '+' : ''}${fmt(c.changePct)}% (24h market cap change)`).join('\n')
-          : null;
-
-        const exposureLines = exposure.length
-          ? exposure.map(e => {
-              const linkedTxt = (e.linked || []).length
-                ? (e.linked || []).map(l => `"${l.name}" (${l.changePct >= 0 ? '+' : ''}${fmt(l.changePct)}%)`).join(', ')
-                : 'no currently-notable category linked';
-              return `  ${e.sym}: ${fmt(e.weight)}% of portfolio, linked to: ${linkedTxt}`;
-            }).join('\n')
-          : null;
-
-        const dataBlock = `CATEGORY MOVEMENTS (CoinGecko sector-level market cap change, ranked by move size — only categories moving beyond a +/-5% threshold are included here; this list is ALREADY filtered and ranked by CryptoPulse, do not re-rank or add categories not listed)
-${catLines || 'None — no category crossed the +/-5% threshold in the last 24h.'}
-
-PORTFOLIO EXPOSURE (the user's actual holdings, weighted by position size, and which of the above categories — if any — each coin is linked to; this mapping was already determined by CryptoPulse, do not invent a different linkage)
-${exposureLines || 'No portfolio data available this session.'}`;
-
-        const prompt = `You are a crypto portfolio analyst identifying whether there is a dominant market narrative right now, and what it means specifically for this user's own holdings — not the market in general. Every number below was already computed by CryptoPulse; never invent, re-rank, or re-link anything not explicitly given.
-
-CRITICAL RULES:
-- If CATEGORY MOVEMENTS says "None," you MUST say plainly that no category crossed the significance threshold today and there is no dominant narrative to report right now — do NOT invent one anyway. A quiet market is a real, useful finding, not a failure to find something.
-- Only discuss categories that are explicitly listed. Do not mention any crypto sector, theme, or story not present in the data above, even if you believe it is generally relevant — you do not have live information about today specifically, only what is given here.
-- For each listed category, only claim a connection to a specific coin (BTC/ETH/SOL/LINK/HYPE) if that coin is explicitly listed as linked to it in PORTFOLIO EXPOSURE. Never assert a link the data doesn't show.
-- Distinguish explicitly between what a 24h category move might mean SHORT-TERM (the next few days — likely just momentum/rotation) versus MEDIUM-TERM (weeks — whether this looks like the start of a sustained theme or a one-off spike) — you do not have enough information here to say anything reliable about LONG-TERM (months+), so do not attempt to.
-- Never state or imply a specific future price target or a guaranteed outcome. This is a read on current positioning and exposure, not a prediction.
-- If PORTFOLIO EXPOSURE says no data is available, do not discuss portfolio-specific impact at all — only discuss the category movements themselves, if any.
-
-OUTPUT FORMAT — plain text, no markdown symbols, structured with blank lines between sections exactly like this:
-
-[One or two sentence summary: is there a dominant narrative right now or not, and if so, the single biggest one.]
-
-Category moves: [2-4 sentences on the notable category movements, if any, or one sentence stating plainly that none crossed the threshold today.]
-
-Your portfolio's exposure: [2-4 sentences on which of the user's specific holdings are linked to the notable categories, their weight in the portfolio, and whether this reads as bullish or bearish for those specific positions. If no categories were notable, say plainly that there is nothing specific to flag for the portfolio right now.]
-
-Short vs medium term: [1-2 sentences distinguishing likely short-term (days) noise/momentum from whether this looks like it could become a sustained medium-term (weeks) theme, or say there isn't enough information to distinguish these if that's the honest read.]
-
-DATA:
-${dataBlock}`;
-
-        const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 500,
-        });
-        const text = typeof result.response === 'string' ? result.response : JSON.stringify(result.response || '');
-        if (!text) throw new Error('Empty model response');
-        return new Response(JSON.stringify({ analysis: text.trim(), ts: Date.now() }), {
-          headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
-      }
-    }
-
-    // ---- POST /gemini-outlook — separate from /narrative-analysis by
-    // design: that route only narrates CryptoPulse's own 24h category data
-    // (deliberately constrained, "never invent anything not given"). This
-    // route calls Gemini directly (the user's own free-tier API key, added
-    // as a Worker secret) and explicitly INVITES it to draw on its own
-    // broader knowledge of current crypto narratives — the whole reason to
-    // use Gemini here is that it isn't limited to a 24h price snapshot the
-    // way the small fast model is. No Google Search grounding for now
-    // (deliberately — grounding's free-tier billing requirement is genuinely
-    // ambiguous per research; base Gemini calls are unambiguously free with
-    // no billing account needed at all). Portfolio composition (real
-    // weights) is the one piece of ground-truth data passed in; the
-    // narrative content itself is Gemini's own synthesis, not something
-    // CryptoPulse computed and is just asking to be narrated. ----
+    // ---- POST /gemini-outlook — powers the "Narrative" tab (previously
+    // called "Outlook"; the old deterministic-only Narrative tab, with its
+    // own /narrative-analysis route, was removed). Calls Gemini directly
+    // (the user's own free-tier API key, added as a Worker secret) and
+    // explicitly INVITES it to draw on its own broader knowledge of current
+    // crypto narratives — the whole reason to use Gemini here is that it
+    // isn't limited to a 24h price snapshot the way the small fast model
+    // is. No Google Search grounding for now (deliberately — grounding's
+    // free-tier billing requirement is genuinely ambiguous per research;
+    // base Gemini calls are unambiguously free with no billing account
+    // needed at all). Portfolio composition (real weights) is the one
+    // piece of ground-truth data passed in; the narrative content itself
+    // is Gemini's own synthesis, not something CryptoPulse computed and is
+    // just asking to be narrated. ----
     if (url.pathname === '/gemini-outlook' && request.method === 'POST') {
       if (!env.GEMINI_API_KEY) {
         return new Response(JSON.stringify({ error: 'GEMINI_API_KEY not configured on this Worker' }), { status: 500, headers: corsHeaders });
