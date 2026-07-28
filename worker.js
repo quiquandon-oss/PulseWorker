@@ -1365,7 +1365,15 @@ Portfolio read: [same structure]
 Overall positioning note: [1-2 sentences synthesizing what this means for the portfolio as a whole across these timeframes.]`;
 
         const geminiRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`,
+          // gemini-2.5-flash was confirmed deprecated for new API keys (the
+          // exact 404 the user's key hit). gemini-3.6-flash is the current
+          // GA flagship Flash model as of testing — confirmed free on
+          // Google AI Studio's tier alongside 3.5 Flash and 3.5 Flash-Lite
+          // (only Pro-series models are paid-only, since April 2026).
+          // Chose the full Flash model over Flash-Lite since narrative
+          // synthesis needs genuine reasoning, not the simple
+          // classification/extraction work Flash-Lite is tuned for.
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
