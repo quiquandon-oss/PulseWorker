@@ -1230,11 +1230,18 @@ ${dataBlock}`;
     // rankings and portfolio exposure deterministically client-side (same
     // architecture principle as everywhere else in this app — this route
     // only narrates, never invents a ranking or a connection the data
-    // doesn't support). Uses gpt-oss-120b rather than the fast 8B model
-    // used elsewhere in this Worker — an explicit experiment for this
-    // specific reasoning-heavy route, not a swap for the faster/cheaper
-    // routes (Whale/Liquidation narration, the alerts cron) where latency
-    // matters more and the reasoning demands are lighter. ----
+    // doesn't support).
+    //
+    // REVERTED from gpt-oss-120b back to the fast Llama model — that was an
+    // explicit experiment (per prior discussion), and real-world testing
+    // showed it failing on two counts: (1) gpt-oss models use OpenAI's
+    // Responses API format via env.AI.run, a completely different response
+    // shape than result.response — the garbled output was this code reading
+    // the wrong field entirely, not the model actually being broken; (2)
+    // even setting that aside, real-world testing showed no return after a
+    // full minute, confirming it's also too slow for this route regardless.
+    // Both problems point the same direction, so reverting rather than
+    // patching the response-parsing for a model that's also proven slow. ----
     if (url.pathname === '/narrative-analysis' && request.method === 'POST') {
       try {
         const data = await request.json();
@@ -1284,7 +1291,7 @@ Short vs medium term: [1-2 sentences distinguishing likely short-term (days) noi
 DATA:
 ${dataBlock}`;
 
-        const result = await env.AI.run('@cf/openai/gpt-oss-120b', {
+        const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
           messages: [{ role: 'user', content: prompt }],
           max_tokens: 500,
         });
