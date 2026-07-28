@@ -524,12 +524,25 @@ export default {
     // published API and may need re-checking if it stops working. ----
     const NINE_MAG_SYMBOLS = ['NVDA', 'AVGO', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'SPCX'];
     if (url.pathname === '/stock-proxy' && request.method === 'GET') {
+      // ?granularity=intraday — 5-minute candles over the current/most
+      // recent trading session, for the 24H tab specifically. Separate
+      // request shape from the daily/3mo one used for 7D/30D/90D (stocks
+      // only trade ~6.5h/day, so "24H" here means "today's session," the
+      // conventional meaning on stock dashboards, not a literal rolling
+      // 24-hour clock). range=2d as a buffer so there's still a session to
+      // show if markets are currently closed (evening/weekend). Only
+      // fetched when the client actually requests this tab, not on every
+      // regular refresh, given this source's documented fragility.
+      const isIntraday = url.searchParams.get('granularity') === 'intraday';
       try {
         const results = await Promise.allSettled(NINE_MAG_SYMBOLS.map(async (sym) => {
           // range=3mo — enough history that range-tab switching (7D/30D/90D)
           // can slice client-side from one fetch, rather than re-calling
           // this unofficial endpoint on every range switch.
-          const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=3mo`, {
+          const yUrl = isIntraday
+            ? `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=5m&range=2d`
+            : `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=3mo`;
+          const res = await fetch(yUrl, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
           });
           if (!res.ok) throw new Error(sym + ' ' + res.status);
@@ -540,7 +553,21 @@ export default {
           const timestamps = result.timestamp || [];
           const closes = result.indicators?.quote?.[0]?.close || [];
           const series = timestamps.map((t, i) => ({ ts: t * 1000, close: closes[i] })).filter((p) => p.close != null);
-          return { sym, price: meta.regularMarketPrice, prevClose: meta.previousClose ?? meta.chartPreviousClose, marketCap: meta.marketCap ?? null, series };
+          // FIX: meta.previousClose / chartPreviousClose became unreliable
+          // once range was extended to 3mo (confirmed via real screenshot
+          // evidence: "24h" cards showing -9% to +26%, which are implausible
+          // as one-day moves but match 1-3 month reality almost exactly —
+          // chartPreviousClose appears to reflect the close before the
+          // requested RANGE began, not yesterday). Derive prevClose directly
+          // from the daily series instead — the second-to-last point vs the
+          // last — removing dependency on that ambiguous meta field. For
+          // intraday requests, keep using meta's previousClose (a genuine
+          // prior-session close, appropriate here since the series itself
+          // is 5-minute intrasession data, not daily closes).
+          const prevClose = isIntraday
+            ? (meta.previousClose ?? meta.chartPreviousClose)
+            : (series.length >= 2 ? series[series.length - 2].close : (meta.previousClose ?? meta.chartPreviousClose));
+          return { sym, price: meta.regularMarketPrice, prevClose, marketCap: meta.marketCap ?? null, series };
         }));
         const quotes = {};
         results.forEach((r, i) => {
