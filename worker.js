@@ -211,6 +211,34 @@ async function fetchLatestFoufiVideo() {
   return { videoId, title: decodeHtmlEntities(titleRaw.trim()), published, url: `https://www.youtube.com/watch?v=${videoId}` };
 }
 
+// Classifies AM vs PM, and weekly/monthly special editions, purely from the
+// publish timestamp — deterministic, not asked of Gemini (same principle as
+// everywhere else in this app: compute what can be computed, LLM only
+// narrates content). Confirmed against a real week of titles (Aug 6, 2026):
+// every day has exactly one ~06:00 UTC video (overnight/macro-flavored) and
+// one ~17:30-19:30 UTC video (technical/TradFi-flavored) — clean AM/PM
+// split on UTC noon. Sunday PM is confirmed as the weekly-close special
+// ("Alerte Clôture Hebdo... MM200W", Aug 2). The monthly video is NOT
+// Sunday-anchored — it's month-boundary anchored: the July wrap posted Aug 1
+// (a Saturday) PM ("BITCOIN FINI JUILLET"), i.e. day 1 of the new month, not
+// the last Sunday of July. Flags day<=2 or day>=(daysInMonth-1) PM as a
+// monthly_close candidate — untested against an actual case where this
+// heuristic's boundary matters (e.g. month-end falling near a Sunday), so
+// revisit once the 3-month backfill gives more real examples.
+function classifyFoufiVideo(publishedIso) {
+  if (!publishedIso) return { videoType: null, specialEdition: null };
+  const d = new Date(publishedIso);
+  const hourUtc = d.getUTCHours();
+  const videoType = hourUtc < 12 ? 'morning' : 'evening';
+  const dow = d.getUTCDay(); // 0 = Sunday
+  const dom = d.getUTCDate();
+  const daysInMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  let specialEdition = null;
+  if (videoType === 'evening' && dow === 0) specialEdition = 'weekly_close';
+  else if (videoType === 'evening' && (dom <= 2 || dom >= daysInMonth - 1)) specialEdition = 'monthly_close';
+  return { videoType, specialEdition };
+}
+
 // Shared by the /foufi-check route and the daily cron in scheduled() below —
 // checks for a new video, hands it to Gemini, stores the result. Never
 // throws past this function; errors come back as { ok:false, error } so
@@ -228,21 +256,28 @@ async function checkFoufiDigest(env, { force = false, videoOverride = null } = {
       if (existing) return { ok: true, skipped: true, reason: 'already processed', video };
     }
 
-    let summaryJson = null, overallLean = null, geminiError = null, rawText = null;
+    const { videoType, specialEdition } = classifyFoufiVideo(video.published);
+
+    let summaryJson = null, geminiError = null, rawText = null;
     try {
-      const prompt = `You are extracting a structured summary from this French-language crypto YouTube video by the analyst "Foufi". Base the summary ONLY on what he actually says and shows in the video — do not add outside knowledge, do not speculate beyond what's covered, and say plainly "not addressed in this video" for any category he doesn't cover rather than inventing content for it.
+      const prompt = `You are extracting a structured summary from this French-language crypto YouTube video by the analyst "Foufi". Base everything ONLY on what he actually says and shows in the video — do not add outside knowledge, do not speculate beyond what's covered. Use "not addressed in this video" for any topic he doesn't cover, and null for any coin he doesn't mention, rather than inventing content.
 
 Respond in English. Plain text only (no markdown symbols). Follow this exact structure and order:
 
-Macro/Geopolitical: [what Foufi said about macro conditions, central banks, geopolitics, or "not addressed in this video"]
-TradFi correlation: [what he said linking crypto to stocks/traditional markets, or "not addressed"]
-Technical (Ichimoku/MA): [his technical read - levels, trend, key indicators mentioned/shown, or "not addressed"]
-Liquidity/Sentiment: [his read on market sentiment, liquidity, funding, positioning, or "not addressed"]
-On-chain/Institutional flow: [what he said about on-chain data, ETF flows, institutional activity, or "not addressed"]
-Overall lean: [one word only: bullish, bearish, or neutral - his overall tone in this specific video]
+Market summary: [2-3 sentences: what crypto broadly did today, per Foufi]
+Macro economy: [central banks, rates, inflation, FX, geopolitics, or "not addressed in this video"]
+Micro economy: [individual company earnings/moves he discussed, or "not addressed in this video"]
+TradFi correlation: [how he links crypto to stock indices like the S&P 500/Nasdaq specifically, or "not addressed in this video"]
+BTC: [score, see scale below, or "not addressed"] — [one-line reason]
+ETH: [same]
+SOL: [same]
+LINK: [same]
+HYPE: [same]
+
+Score scale for each coin: -2 very bearish, -1 bearish, 0 neutral, +1 bullish, +2 very bullish — based on his stated view for THAT coin specifically, not the market overall. Most videos only address BTC and sometimes ETH — leaving the others "not addressed" is the normal, expected case, not a failure.
 
 On its own final line, nothing else on it:
-FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","onchain":"...","lean":"bullish|bearish|neutral"}`;
+FOUFI_JSON: {"market_summary":"...","macro":{"lean":"bullish|bearish|neutral","text":"..."},"micro":{"lean":"bullish|bearish|neutral","text":"..."},"tradfi":{"lean":"bullish|bearish|neutral","text":"..."},"coins":{"BTC":{"score":-2,"note":"..."},"ETH":{"score":null,"note":"not addressed in this video"},"SOL":{"score":null,"note":"..."},"LINK":{"score":null,"note":"..."},"HYPE":{"score":null,"note":"..."}}}`;
 
       const geminiRes = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
@@ -269,7 +304,7 @@ FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","o
       rawText = text.trim();
       const match = rawText.match(/FOUFI_JSON:\s*(\{[\s\S]*\})\s*$/);
       if (match) {
-        try { summaryJson = JSON.parse(match[1]); overallLean = summaryJson.lean || null; }
+        try { summaryJson = JSON.parse(match[1]); }
         catch (e) { summaryJson = { raw: rawText, parseError: e.message }; }
       } else {
         summaryJson = { raw: rawText };
@@ -278,10 +313,16 @@ FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","o
       geminiError = err.message;
     }
 
-    const status = summaryJson && !geminiError ? 'ok' : 'error';
+    // Legacy simple lean, kept for backward compatibility with anything still
+    // reading the plain overall_lean column — derived from BTC's score sign
+    // since BTC is addressed in essentially every video, unlike the others.
+    const btcScore = summaryJson?.coins?.BTC?.score;
+    const overallLean = typeof btcScore === 'number' ? (btcScore > 0 ? 'bullish' : btcScore < 0 ? 'bearish' : 'neutral') : null;
+
+    const status = summaryJson && !geminiError && !summaryJson.raw ? 'ok' : (summaryJson?.raw ? 'unstructured' : 'error');
     const now = Date.now();
     await env.DB.prepare(
-      'INSERT OR REPLACE INTO foufi_digest (video_id, published_ts, title, url, transcript_status, summary_json, overall_lean, fetched_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+      'INSERT OR REPLACE INTO foufi_digest (video_id, published_ts, title, url, transcript_status, summary_json, overall_lean, fetched_ts, video_type, special_edition) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).bind(
       video.videoId,
       video.published ? new Date(video.published).getTime() : null,
@@ -290,10 +331,12 @@ FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","o
       status,
       summaryJson ? JSON.stringify(summaryJson) : null,
       overallLean,
-      now
+      now,
+      videoType,
+      specialEdition
     ).run();
 
-    return { ok: true, video, status, geminiError, summary: summaryJson };
+    return { ok: true, video, videoType, specialEdition, status, geminiError, summary: summaryJson };
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -1521,24 +1564,69 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
       }
     }
 
+    // Shared formatter for both routes below.
+    function formatDigestRow(row) {
+      let summary = null;
+      try { summary = row.summary_json ? JSON.parse(row.summary_json) : null; } catch (e) { /* leave null */ }
+      return {
+        videoId: row.video_id,
+        title: row.title,
+        url: row.url,
+        publishedTs: row.published_ts,
+        status: row.transcript_status,
+        overallLean: row.overall_lean,
+        videoType: row.video_type,
+        specialEdition: row.special_edition,
+        summary,
+        fetchedTs: row.fetched_ts,
+      };
+    }
+
+    // ---- GET /foufi-latest — the 2 most recent digests (in normal operation,
+    // today's AM+PM — or yesterday's PM + today's AM if today's PM hasn't
+    // posted yet), for the side-by-side Trader Analysis tile. Read-only,
+    // never triggers a Gemini call itself. ----
     if (url.pathname === '/foufi-latest' && request.method === 'GET') {
       try {
-        const row = await env.DB.prepare('SELECT * FROM foufi_digest ORDER BY fetched_ts DESC LIMIT 1').first();
-        if (!row) return new Response(JSON.stringify({ digest: null }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        let summary = null;
-        try { summary = row.summary_json ? JSON.parse(row.summary_json) : null; } catch (e) { /* leave null */ }
-        return new Response(JSON.stringify({
-          digest: {
-            videoId: row.video_id,
-            title: row.title,
-            url: row.url,
-            publishedTs: row.published_ts,
-            status: row.transcript_status,
-            overallLean: row.overall_lean,
-            summary,
-            fetchedTs: row.fetched_ts,
-          },
-        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const { results } = await env.DB.prepare('SELECT * FROM foufi_digest ORDER BY published_ts DESC LIMIT 2').all();
+        return new Response(JSON.stringify({ latest: results.map(formatDigestRow) }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // ---- GET /foufi-recent?days=90 — for the collapsible recap table.
+    // Joins each digest against the closest same-day CryptoPulse Sentiment
+    // history row (same "closest within tolerance" pattern used everywhere
+    // else in this app, e.g. computeRegimeBacktest) so each row can show
+    // "what Foufi said" next to "what our own Sentiment Engine said" that
+    // day — the comparison the person asked for, without registering Foufi
+    // as a scored Sentiment source (deliberately not done yet). ----
+    if (url.pathname === '/foufi-recent' && request.method === 'GET') {
+      try {
+        const days = Math.min(120, Math.max(1, parseInt(url.searchParams.get('days') || '90', 10) || 90));
+        const cutoff = Date.now() - days * 86400000;
+        const { results: digestRows } = await env.DB.prepare(
+          'SELECT * FROM foufi_digest WHERE published_ts >= ? ORDER BY published_ts DESC'
+        ).bind(cutoff).all();
+        const { results: historyRows } = await env.DB.prepare(
+          'SELECT ts, score FROM history WHERE ts >= ? AND score IS NOT NULL ORDER BY ts ASC'
+        ).bind(cutoff).all();
+        const tolerance = 4 * 3600000; // within 4h counts as "same reading"
+        function nearestSentiment(ts) {
+          let best = null, bestDiff = Infinity;
+          for (const h of historyRows) {
+            const diff = Math.abs(h.ts - ts);
+            if (diff < bestDiff) { bestDiff = diff; best = h; }
+          }
+          return (best && bestDiff <= tolerance) ? best.score : null;
+        }
+        const rows = digestRows.map(row => {
+          const d = formatDigestRow(row);
+          d.sentimentScoreThatDay = row.published_ts ? nearestSentiment(row.published_ts) : null;
+          return d;
+        });
+        return new Response(JSON.stringify({ days, count: rows.length, rows }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
       }
