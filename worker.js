@@ -1495,6 +1495,33 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
     // Worker's shared/datacenter IP getting flagged, regardless of endpoint).
     // Also runs on a daily cron now (see scheduled() below) — this route stays
     // for manual testing (?force=1, ?video=ID). ----
+    // ---- GET /foufi-latest — read-only, for the Trader Analysis tile. Just
+    // returns the most recently stored digest row; never triggers a Gemini
+    // call itself (that only happens via checkFoufiDigest, from the hourly
+    // cron or the manual /foufi-check route). ----
+    if (url.pathname === '/foufi-latest' && request.method === 'GET') {
+      try {
+        const row = await env.DB.prepare('SELECT * FROM foufi_digest ORDER BY fetched_ts DESC LIMIT 1').first();
+        if (!row) return new Response(JSON.stringify({ digest: null }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        let summary = null;
+        try { summary = row.summary_json ? JSON.parse(row.summary_json) : null; } catch (e) { /* leave null */ }
+        return new Response(JSON.stringify({
+          digest: {
+            videoId: row.video_id,
+            title: row.title,
+            url: row.url,
+            publishedTs: row.published_ts,
+            status: row.transcript_status,
+            overallLean: row.overall_lean,
+            summary,
+            fetchedTs: row.fetched_ts,
+          },
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
     if (url.pathname === '/foufi-check' && request.method === 'GET') {
       const force = url.searchParams.get('force') === '1';
       const videoOverride = url.searchParams.get('video');
