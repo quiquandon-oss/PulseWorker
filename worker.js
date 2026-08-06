@@ -211,55 +211,6 @@ async function fetchLatestFoufiVideo() {
   return { videoId, title: decodeHtmlEntities(titleRaw.trim()), published, url: `https://www.youtube.com/watch?v=${videoId}` };
 }
 
-async function fetchYouTubeTranscript(videoId) {
-  // Third approach: /api/timedtext?type=list came back empty for every video
-  // tested (including a 3-week-old one that definitely has captions) —
-  // that endpoint appears to be dead, not rate-limited. This calls the
-  // Innertube player API directly instead — the same internal API every
-  // youtube.com page load uses to fetch player data, reached here without
-  // downloading the full watch page HTML. The key below is the public WEB
-  // client key baked into every YouTube page's JS (not a secret credential,
-  // just a client identifier — the same one yt-dlp and similar tools use).
-  const INNERTUBE_API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-  const playerRes = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': BROWSER_UA },
-    body: JSON.stringify({
-      videoId,
-      context: { client: { clientName: 'WEB', clientVersion: '2.20240101.00.00' } },
-    }),
-  });
-  if (!playerRes.ok) return { status: 'unavailable', lang: null, error: 'innertube player ' + playerRes.status };
-  const playerJson = await playerRes.json();
-  const tracks = playerJson?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  if (!tracks || !tracks.length) {
-    return {
-      status: 'unavailable', lang: null, error: 'no captionTracks in innertube player response',
-      debugPlaybackStatus: playerJson?.playabilityStatus?.status ?? null,
-      debugPlaybackReason: playerJson?.playabilityStatus?.reason ?? null,
-      debugTopLevelKeys: Object.keys(playerJson || {}),
-    };
-  }
-
-  // Prefer a manually-authored French track over auto-generated (kind:'asr'),
-  // then any French variant, then whatever exists rather than failing outright.
-  const pick = tracks.find(t => t.languageCode === 'fr' && t.kind !== 'asr')
-    || tracks.find(t => t.languageCode === 'fr')
-    || tracks.find(t => (t.languageCode || '').startsWith('fr'))
-    || tracks[0];
-
-  const capRes = await fetch(pick.baseUrl, { headers: { 'User-Agent': BROWSER_UA } });
-  if (!capRes.ok) return { status: 'unavailable', lang: pick.languageCode, error: 'caption content fetch ' + capRes.status };
-  const capXml = await capRes.text();
-  const text = [...capXml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)]
-    .map(m => decodeHtmlEntities(m[1]))
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!text) return { status: 'unavailable', lang: pick.languageCode, error: 'caption track was empty after parsing', debugCapLength: capXml.length, debugCapSnippet: capXml.slice(0, 300) };
-  return { status: 'ok', text, lang: pick.languageCode, kind: pick.kind === 'asr' ? 'auto-generated' : 'manual' };
-}
-
 // ---------- Telegram ----------
 async function sendTelegram(env, text) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
@@ -1433,13 +1384,19 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
     }
 
     // ---- GET /foufi-check?force=1 — TEST ROUTE, not yet wired to any UI.
-    // Checks Foufi's YouTube channel for its latest video, pulls the French
-    // transcript (unofficial — see fetchYouTubeTranscript above), and asks
-    // Gemini to extract only what he actually said, structured around his
-    // own 5-point framework (the same one that shaped this app's Sentiment
-    // Engine / Regime Scorecard). Deliberately constrained to the transcript
-    // content only — no outside-knowledge synthesis, unlike /gemini-outlook —
-    // this is meant to report what Foufi said, not what Gemini thinks.
+    // Checks Foufi's YouTube channel for its latest video and hands the URL
+    // directly to Gemini (file_data part, YouTube-URL-as-input — a Gemini
+    // API preview feature, free) to extract only what he actually said,
+    // structured around his own 5-point framework (the same one that shaped
+    // this app's Sentiment Engine / Regime Scorecard). Deliberately
+    // constrained to the video's own content — no outside-knowledge
+    // synthesis, unlike /gemini-outlook — this reports what Foufi said, not
+    // what Gemini thinks. No transcript-scraping needed: Google's own
+    // servers fetch the video, sidestepping the YouTube bot-detection wall
+    // three earlier attempts here hit trying to scrape it from the Worker
+    // directly (watch-page scrape → 429; timedtext list → dead endpoint;
+    // Innertube player → LOGIN_REQUIRED bot challenge — all three were the
+    // Worker's shared/datacenter IP getting flagged, regardless of endpoint).
     // ?force=1 bypasses the "already processed" check, for manual testing. ----
     if (url.pathname === '/foufi-check' && request.method === 'GET') {
       if (!env.GEMINI_API_KEY) {
@@ -1459,24 +1416,15 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
           }
         }
 
-        const transcript = await fetchYouTubeTranscript(video.videoId);
-
-        let summaryJson = null, overallLean = null, geminiError = null;
-        if (transcript.status === 'ok') {
-          try {
-            const capped = transcript.text.length > 15000 ? transcript.text.slice(0, 15000) + '...' : transcript.text;
-            const prompt = `You are extracting a structured summary from a French-language crypto YouTube video transcript by the analyst "Foufi". Summarize ONLY what is actually said in the transcript below — do not add outside knowledge, do not speculate beyond what is stated, and say plainly "not addressed in this video" for any category he doesn't cover rather than inventing content for it.
-
-TRANSCRIPT (French, auto/manual captions, may contain minor transcription errors):
-"""
-${capped}
-"""
+        let summaryJson = null, overallLean = null, geminiError = null, rawText = null;
+        try {
+          const prompt = `You are extracting a structured summary from this French-language crypto YouTube video by the analyst "Foufi". Base the summary ONLY on what he actually says and shows in the video — do not add outside knowledge, do not speculate beyond what's covered, and say plainly "not addressed in this video" for any category he doesn't cover rather than inventing content for it.
 
 Respond in English. Plain text only (no markdown symbols). Follow this exact structure and order:
 
 Macro/Geopolitical: [what Foufi said about macro conditions, central banks, geopolitics, or "not addressed in this video"]
 TradFi correlation: [what he said linking crypto to stocks/traditional markets, or "not addressed"]
-Technical (Ichimoku/MA): [his technical read - levels, trend, key indicators mentioned, or "not addressed"]
+Technical (Ichimoku/MA): [his technical read - levels, trend, key indicators mentioned/shown, or "not addressed"]
 Liquidity/Sentiment: [his read on market sentiment, liquidity, funding, positioning, or "not addressed"]
 On-chain/Institutional flow: [what he said about on-chain data, ETF flows, institutional activity, or "not addressed"]
 Overall lean: [one word only: bullish, bearish, or neutral - his overall tone in this specific video]
@@ -1484,33 +1432,41 @@ Overall lean: [one word only: bullish, bearish, or neutral - his overall tone in
 On its own final line, nothing else on it:
 FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","onchain":"...","lean":"bullish|bearish|neutral"}`;
 
-            const geminiRes = await fetch(
-              `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
-                body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-              }
-            );
-            if (!geminiRes.ok) {
-              const errBody = await geminiRes.text();
-              throw new Error(`Gemini API ${geminiRes.status}: ${errBody.slice(0, 300)}`);
+          const geminiRes = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+              body: JSON.stringify({
+                contents: [{
+                  parts: [
+                    { text: prompt },
+                    { file_data: { file_uri: video.url } },
+                  ],
+                }],
+              }),
             }
-            const geminiJsonRes = await geminiRes.json();
-            const text = geminiJsonRes?.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (!text) throw new Error('Empty or unexpected Gemini response shape: ' + JSON.stringify(geminiJsonRes).slice(0, 300));
-            const match = text.match(/FOUFI_JSON:\s*(\{[\s\S]*\})\s*$/);
-            if (match) {
-              try { summaryJson = JSON.parse(match[1]); overallLean = summaryJson.lean || null; }
-              catch (e) { summaryJson = { raw: text.trim(), parseError: e.message }; }
-            } else {
-              summaryJson = { raw: text.trim() };
-            }
-          } catch (err) {
-            geminiError = err.message;
+          );
+          if (!geminiRes.ok) {
+            const errBody = await geminiRes.text();
+            throw new Error(`Gemini API ${geminiRes.status}: ${errBody.slice(0, 400)}`);
           }
+          const geminiJsonRes = await geminiRes.json();
+          const text = geminiJsonRes?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!text) throw new Error('Empty or unexpected Gemini response shape: ' + JSON.stringify(geminiJsonRes).slice(0, 400));
+          rawText = text.trim();
+          const match = rawText.match(/FOUFI_JSON:\s*(\{[\s\S]*\})\s*$/);
+          if (match) {
+            try { summaryJson = JSON.parse(match[1]); overallLean = summaryJson.lean || null; }
+            catch (e) { summaryJson = { raw: rawText, parseError: e.message }; }
+          } else {
+            summaryJson = { raw: rawText };
+          }
+        } catch (err) {
+          geminiError = err.message;
         }
 
+        const status = summaryJson && !geminiError ? 'ok' : 'error';
         const now = Date.now();
         await env.DB.prepare(
           'INSERT OR REPLACE INTO foufi_digest (video_id, published_ts, title, url, transcript_status, summary_json, overall_lean, fetched_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
@@ -1519,7 +1475,7 @@ FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","o
           video.published ? new Date(video.published).getTime() : null,
           video.title,
           video.url,
-          transcript.status,
+          status,
           summaryJson ? JSON.stringify(summaryJson) : null,
           overallLean,
           now
@@ -1528,11 +1484,7 @@ FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","o
         return new Response(JSON.stringify({
           ok: true,
           video,
-          transcriptStatus: transcript.status,
-          transcriptLang: transcript.lang || null,
-          transcriptKind: transcript.kind || null,
-          transcriptChars: transcript.text ? transcript.text.length : 0,
-          transcriptDebug: Object.fromEntries(Object.entries(transcript).filter(([k]) => !['status', 'lang', 'kind', 'text'].includes(k))),
+          status,
           geminiError,
           summary: summaryJson,
         }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
