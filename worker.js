@@ -232,10 +232,15 @@ function classifyFoufiVideo(publishedIso) {
   const videoType = hourUtc < 12 ? 'morning' : 'evening';
   const dow = d.getUTCDay(); // 0 = Sunday
   const dom = d.getUTCDate();
-  const daysInMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
   let specialEdition = null;
   if (videoType === 'evening' && dow === 0) specialEdition = 'weekly_close';
-  else if (videoType === 'evening' && (dom <= 2 || dom >= daysInMonth - 1)) specialEdition = 'monthly_close';
+  // NARROWED after a real false-positive: originally also flagged
+  // dom>=daysInMonth-1 (tail of the outgoing month), on the guess that the
+  // monthly video might sometimes land there instead. Live data disproved
+  // it immediately — Jul 30 and Jul 31 (ordinary PM videos, no monthly
+  // content) both got wrongly tagged, while only Aug 1 (the real "BITCOIN
+  // FINI JUILLET" wrap) was genuine. Narrowed to only the confirmed case.
+  else if (videoType === 'evening' && dom <= 2) specialEdition = 'monthly_close';
   return { videoType, specialEdition };
 }
 
