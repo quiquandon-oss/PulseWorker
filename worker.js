@@ -211,6 +211,94 @@ async function fetchLatestFoufiVideo() {
   return { videoId, title: decodeHtmlEntities(titleRaw.trim()), published, url: `https://www.youtube.com/watch?v=${videoId}` };
 }
 
+// Shared by the /foufi-check route and the daily cron in scheduled() below —
+// checks for a new video, hands it to Gemini, stores the result. Never
+// throws past this function; errors come back as { ok:false, error } so
+// callers (an HTTP response vs. a cron's ctx.waitUntil) can each handle them
+// appropriately rather than this function assuming which one is calling.
+async function checkFoufiDigest(env, { force = false, videoOverride = null } = {}) {
+  if (!env.GEMINI_API_KEY) return { ok: false, error: 'GEMINI_API_KEY not configured on this Worker' };
+  try {
+    const video = videoOverride
+      ? { videoId: videoOverride, title: '(manual video id — RSS lookup skipped)', published: null, url: `https://www.youtube.com/watch?v=${videoOverride}` }
+      : await fetchLatestFoufiVideo();
+
+    if (!force) {
+      const existing = await env.DB.prepare('SELECT video_id FROM foufi_digest WHERE video_id = ?').bind(video.videoId).first();
+      if (existing) return { ok: true, skipped: true, reason: 'already processed', video };
+    }
+
+    let summaryJson = null, overallLean = null, geminiError = null, rawText = null;
+    try {
+      const prompt = `You are extracting a structured summary from this French-language crypto YouTube video by the analyst "Foufi". Base the summary ONLY on what he actually says and shows in the video — do not add outside knowledge, do not speculate beyond what's covered, and say plainly "not addressed in this video" for any category he doesn't cover rather than inventing content for it.
+
+Respond in English. Plain text only (no markdown symbols). Follow this exact structure and order:
+
+Macro/Geopolitical: [what Foufi said about macro conditions, central banks, geopolitics, or "not addressed in this video"]
+TradFi correlation: [what he said linking crypto to stocks/traditional markets, or "not addressed"]
+Technical (Ichimoku/MA): [his technical read - levels, trend, key indicators mentioned/shown, or "not addressed"]
+Liquidity/Sentiment: [his read on market sentiment, liquidity, funding, positioning, or "not addressed"]
+On-chain/Institutional flow: [what he said about on-chain data, ETF flows, institutional activity, or "not addressed"]
+Overall lean: [one word only: bullish, bearish, or neutral - his overall tone in this specific video]
+
+On its own final line, nothing else on it:
+FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","onchain":"...","lean":"bullish|bearish|neutral"}`;
+
+      const geminiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { text: prompt },
+                { file_data: { file_uri: video.url } },
+              ],
+            }],
+          }),
+        }
+      );
+      if (!geminiRes.ok) {
+        const errBody = await geminiRes.text();
+        throw new Error(`Gemini API ${geminiRes.status}: ${errBody.slice(0, 400)}`);
+      }
+      const geminiJsonRes = await geminiRes.json();
+      const text = geminiJsonRes?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) throw new Error('Empty or unexpected Gemini response shape: ' + JSON.stringify(geminiJsonRes).slice(0, 400));
+      rawText = text.trim();
+      const match = rawText.match(/FOUFI_JSON:\s*(\{[\s\S]*\})\s*$/);
+      if (match) {
+        try { summaryJson = JSON.parse(match[1]); overallLean = summaryJson.lean || null; }
+        catch (e) { summaryJson = { raw: rawText, parseError: e.message }; }
+      } else {
+        summaryJson = { raw: rawText };
+      }
+    } catch (err) {
+      geminiError = err.message;
+    }
+
+    const status = summaryJson && !geminiError ? 'ok' : 'error';
+    const now = Date.now();
+    await env.DB.prepare(
+      'INSERT OR REPLACE INTO foufi_digest (video_id, published_ts, title, url, transcript_status, summary_json, overall_lean, fetched_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(
+      video.videoId,
+      video.published ? new Date(video.published).getTime() : null,
+      video.title,
+      video.url,
+      status,
+      summaryJson ? JSON.stringify(summaryJson) : null,
+      overallLean,
+      now
+    ).run();
+
+    return { ok: true, video, status, geminiError, summary: summaryJson };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 // ---------- Telegram ----------
 async function sendTelegram(env, text) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
@@ -395,11 +483,19 @@ const FRED_SERIES_LABELS = {
 
 export default {
   async scheduled(event, env, ctx) {
-    // Two crons share this handler now (see wrangler.toml): "0 6,18 * * *" for
-    // the existing technical eval, "*/15 * * * *" for the new alert checker.
-    // event.cron tells us which one fired.
+    // Three crons share this handler now (see wrangler.toml): "0 6,18 * * *"
+    // for the existing technical eval, "*/15 * * * *" for the alert checker,
+    // "0 * * * *" (hourly) for the Foufi digest check. Hourly rather than a
+    // single fixed daily time because Foufi's actual publish time varies
+    // (seen anywhere from morning to evening) — checkFoufiDigest's own dedup
+    // (skip if that video_id is already in foufi_digest) makes the other 23
+    // hourly runs each day a cheap no-op (one D1 SELECT) rather than 23
+    // redundant Gemini video calls, so hourly costs almost nothing extra
+    // over guessing a single fixed time and often being late or early.
     if (event.cron === '*/15 * * * *') {
       ctx.waitUntil(evaluateAlerts(env));
+    } else if (event.cron === '0 * * * *') {
+      ctx.waitUntil(checkFoufiDigest(env));
     } else {
       ctx.waitUntil(runTechnicalEvaluation(env));
     }
@@ -1397,100 +1493,16 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
     // directly (watch-page scrape → 429; timedtext list → dead endpoint;
     // Innertube player → LOGIN_REQUIRED bot challenge — all three were the
     // Worker's shared/datacenter IP getting flagged, regardless of endpoint).
-    // ?force=1 bypasses the "already processed" check, for manual testing. ----
+    // Also runs on a daily cron now (see scheduled() below) — this route stays
+    // for manual testing (?force=1, ?video=ID). ----
     if (url.pathname === '/foufi-check' && request.method === 'GET') {
-      if (!env.GEMINI_API_KEY) {
-        return new Response(JSON.stringify({ error: 'GEMINI_API_KEY not configured on this Worker' }), { status: 500, headers: corsHeaders });
-      }
       const force = url.searchParams.get('force') === '1';
       const videoOverride = url.searchParams.get('video');
-      try {
-        const video = videoOverride
-          ? { videoId: videoOverride, title: '(manual video id — RSS lookup skipped)', published: null, url: `https://www.youtube.com/watch?v=${videoOverride}` }
-          : await fetchLatestFoufiVideo();
-
-        if (!force) {
-          const existing = await env.DB.prepare('SELECT video_id FROM foufi_digest WHERE video_id = ?').bind(video.videoId).first();
-          if (existing) {
-            return new Response(JSON.stringify({ ok: true, skipped: true, reason: 'already processed', video }), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
-          }
-        }
-
-        let summaryJson = null, overallLean = null, geminiError = null, rawText = null;
-        try {
-          const prompt = `You are extracting a structured summary from this French-language crypto YouTube video by the analyst "Foufi". Base the summary ONLY on what he actually says and shows in the video — do not add outside knowledge, do not speculate beyond what's covered, and say plainly "not addressed in this video" for any category he doesn't cover rather than inventing content for it.
-
-Respond in English. Plain text only (no markdown symbols). Follow this exact structure and order:
-
-Macro/Geopolitical: [what Foufi said about macro conditions, central banks, geopolitics, or "not addressed in this video"]
-TradFi correlation: [what he said linking crypto to stocks/traditional markets, or "not addressed"]
-Technical (Ichimoku/MA): [his technical read - levels, trend, key indicators mentioned/shown, or "not addressed"]
-Liquidity/Sentiment: [his read on market sentiment, liquidity, funding, positioning, or "not addressed"]
-On-chain/Institutional flow: [what he said about on-chain data, ETF flows, institutional activity, or "not addressed"]
-Overall lean: [one word only: bullish, bearish, or neutral - his overall tone in this specific video]
-
-On its own final line, nothing else on it:
-FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","onchain":"...","lean":"bullish|bearish|neutral"}`;
-
-          const geminiRes = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
-              body: JSON.stringify({
-                contents: [{
-                  parts: [
-                    { text: prompt },
-                    { file_data: { file_uri: video.url } },
-                  ],
-                }],
-              }),
-            }
-          );
-          if (!geminiRes.ok) {
-            const errBody = await geminiRes.text();
-            throw new Error(`Gemini API ${geminiRes.status}: ${errBody.slice(0, 400)}`);
-          }
-          const geminiJsonRes = await geminiRes.json();
-          const text = geminiJsonRes?.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (!text) throw new Error('Empty or unexpected Gemini response shape: ' + JSON.stringify(geminiJsonRes).slice(0, 400));
-          rawText = text.trim();
-          const match = rawText.match(/FOUFI_JSON:\s*(\{[\s\S]*\})\s*$/);
-          if (match) {
-            try { summaryJson = JSON.parse(match[1]); overallLean = summaryJson.lean || null; }
-            catch (e) { summaryJson = { raw: rawText, parseError: e.message }; }
-          } else {
-            summaryJson = { raw: rawText };
-          }
-        } catch (err) {
-          geminiError = err.message;
-        }
-
-        const status = summaryJson && !geminiError ? 'ok' : 'error';
-        const now = Date.now();
-        await env.DB.prepare(
-          'INSERT OR REPLACE INTO foufi_digest (video_id, published_ts, title, url, transcript_status, summary_json, overall_lean, fetched_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-        ).bind(
-          video.videoId,
-          video.published ? new Date(video.published).getTime() : null,
-          video.title,
-          video.url,
-          status,
-          summaryJson ? JSON.stringify(summaryJson) : null,
-          overallLean,
-          now
-        ).run();
-
-        return new Response(JSON.stringify({
-          ok: true,
-          video,
-          status,
-          geminiError,
-          summary: summaryJson,
-        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
-      }
+      const result = await checkFoufiDigest(env, { force, videoOverride });
+      return new Response(JSON.stringify(result), {
+        status: result.ok ? 200 : 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      });
     }
 
     // ---- Anything else: not a route this Worker serves ----
