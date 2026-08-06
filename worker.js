@@ -1672,7 +1672,7 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
           if (existing && existing.transcript_status !== 'error') continue; // already handled
           if (results.length >= limit) { remaining++; continue; }
           const r = await checkFoufiDigest(env, { force: true, videoObj: entry });
-          results.push({ videoId: entry.videoId, title: entry.title, status: r.status || r.error });
+          results.push({ videoId: entry.videoId, title: entry.title, status: r.status || 'error', error: r.geminiError || r.error || null });
         }
         return new Response(JSON.stringify({ ok: true, processedThisCall: results.length, remaining, totalEntriesInFeed: entries.length, results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
       } catch (err) {
