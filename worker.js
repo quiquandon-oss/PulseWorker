@@ -228,7 +228,13 @@ async function fetchYouTubeTranscript(videoId) {
     for (const am of m[1].matchAll(/(\w+)="([^"]*)"/g)) attrs[am[1]] = decodeHtmlEntities(am[2]);
     return attrs;
   });
-  if (!trackMatches.length) return { status: 'unavailable', text: null, lang: null, error: 'no caption tracks listed for this video' };
+  if (!trackMatches.length) {
+    // Debug aid for this test phase: distinguish "genuinely no captions yet"
+    // (very recent upload — YouTube's auto-captions can lag hours behind
+    // publish) from "my parsing assumption about this endpoint's response
+    // shape is wrong" — those need different fixes.
+    return { status: 'unavailable', text: null, lang: null, error: 'no caption tracks listed for this video', debugListLength: listXml.length, debugListSnippet: listXml.slice(0, 400) };
+  }
 
   // Prefer a manually-authored French track over auto-generated (kind:'asr'),
   // then any French variant, then whatever exists rather than failing outright.
@@ -1439,8 +1445,11 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
         return new Response(JSON.stringify({ error: 'GEMINI_API_KEY not configured on this Worker' }), { status: 500, headers: corsHeaders });
       }
       const force = url.searchParams.get('force') === '1';
+      const videoOverride = url.searchParams.get('video');
       try {
-        const video = await fetchLatestFoufiVideo();
+        const video = videoOverride
+          ? { videoId: videoOverride, title: '(manual video id — RSS lookup skipped)', published: null, url: `https://www.youtube.com/watch?v=${videoOverride}` }
+          : await fetchLatestFoufiVideo();
 
         if (!force) {
           const existing = await env.DB.prepare('SELECT video_id FROM foufi_digest WHERE video_id = ?').bind(video.videoId).first();
@@ -1523,6 +1532,8 @@ FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","o
           transcriptLang: transcript.lang || null,
           transcriptKind: transcript.kind || null,
           transcriptChars: transcript.text ? transcript.text.length : 0,
+          transcriptDebugListLength: transcript.debugListLength ?? null,
+          transcriptDebugListSnippet: transcript.debugListSnippet ?? null,
           geminiError,
           summary: summaryJson,
         }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
