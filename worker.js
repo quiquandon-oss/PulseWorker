@@ -244,12 +244,14 @@ function classifyFoufiVideo(publishedIso) {
 // throws past this function; errors come back as { ok:false, error } so
 // callers (an HTTP response vs. a cron's ctx.waitUntil) can each handle them
 // appropriately rather than this function assuming which one is calling.
-async function checkFoufiDigest(env, { force = false, videoOverride = null } = {}) {
+async function checkFoufiDigest(env, { force = false, videoOverride = null, videoObj = null } = {}) {
   if (!env.GEMINI_API_KEY) return { ok: false, error: 'GEMINI_API_KEY not configured on this Worker' };
   try {
-    const video = videoOverride
-      ? { videoId: videoOverride, title: '(manual video id — RSS lookup skipped)', published: null, url: `https://www.youtube.com/watch?v=${videoOverride}` }
-      : await fetchLatestFoufiVideo();
+    const video = videoObj
+      ? videoObj
+      : videoOverride
+        ? { videoId: videoOverride, title: '(manual video id — RSS lookup skipped)', published: null, url: `https://www.youtube.com/watch?v=${videoOverride}` }
+        : await fetchLatestFoufiVideo();
 
     if (!force) {
       // Only 'ok' (and 'unstructured' — Gemini answered, just not in the
@@ -1635,6 +1637,46 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
         return new Response(JSON.stringify({ days, count: rows.length, rows }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // ---- GET /foufi-backfill-rss?limit=3 — processes videos already
+    // exposed by the channel RSS (~15 most recent, ~1 week) that aren't yet
+    // in foufi_digest. Oldest-unprocessed-first, so an interrupted batch
+    // still leaves a contiguous block of history rather than gaps. Small
+    // default batch size — each video is a real Gemini video-understanding
+    // call (real wall-clock time, not just a fetch), so this stays
+    // deliberately conservative rather than risking a request timeout by
+    // trying to clear the whole backlog in one call. Call repeatedly
+    // (response tells you how many are left) until caught up. This is NOT
+    // the 3-month backfill — RSS structurally can't see further back than
+    // this; that one needs the YouTube Data API key, separately. ----
+    if (url.pathname === '/foufi-backfill-rss' && request.method === 'GET') {
+      try {
+        const limit = Math.min(10, Math.max(1, parseInt(url.searchParams.get('limit') || '3', 10) || 3));
+        const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${FOUFI_CHANNEL_ID}`, { headers: { 'User-Agent': BROWSER_UA } });
+        if (!res.ok) throw new Error('YouTube RSS ' + res.status);
+        const xml = await res.text();
+        const entries = [...xml.matchAll(/<entry>[\s\S]*?<\/entry>/g)].map(m => {
+          const entry = m[0];
+          const videoId = entry.match(/<yt:videoId>(.*?)<\/yt:videoId>/)?.[1];
+          const titleRaw = entry.match(/<title>([\s\S]*?)<\/title>/)?.[1];
+          const published = entry.match(/<published>(.*?)<\/published>/)?.[1];
+          return videoId ? { videoId, title: titleRaw ? decodeHtmlEntities(titleRaw.trim()) : videoId, published, url: `https://www.youtube.com/watch?v=${videoId}` } : null;
+        }).filter(Boolean);
+
+        const results = [];
+        let remaining = 0;
+        for (const entry of entries.slice().reverse()) { // oldest first
+          const existing = await env.DB.prepare('SELECT transcript_status FROM foufi_digest WHERE video_id = ?').bind(entry.videoId).first();
+          if (existing && existing.transcript_status !== 'error') continue; // already handled
+          if (results.length >= limit) { remaining++; continue; }
+          const r = await checkFoufiDigest(env, { force: true, videoObj: entry });
+          results.push({ videoId: entry.videoId, title: entry.title, status: r.status || r.error });
+        }
+        return new Response(JSON.stringify({ ok: true, processedThisCall: results.length, remaining, totalEntriesInFeed: entries.length, results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
       }
     }
 
