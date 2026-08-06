@@ -173,6 +173,94 @@ function parseRssTitles(xml, sourceName) {
   return items;
 }
 
+// ---------- Foufi daily digest: YouTube RSS + unofficial transcript fetch ----------
+// TEST-PHASE NOTE: unlike the RSS proxies above (official feeds, stable
+// format), this reverse-engineers two undocumented YouTube surfaces the same
+// way open-source transcript tools do: the channel RSS (documented-ish,
+// stable) for "is there a new video", and the ytInitialPlayerResponse blob
+// embedded in the watch page (NOT documented, can shift) for the actual
+// caption track URL. Every step fails gracefully into a status string rather
+// than throwing past this function, same discipline as the rest of this file
+// — but this is the one part of this Worker never yet tested against live
+// YouTube (Cloudflare Workers aren't reachable from the dev sandbox that
+// wrote this), so the first real /foufi-check call is the real test.
+function decodeHtmlEntities(s) {
+  return s
+    .replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+}
+
+const FOUFI_CHANNEL_ID = 'UCfCMwYqt_OEBvOT4cKq42LQ';
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+async function fetchLatestFoufiVideo() {
+  const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${FOUFI_CHANNEL_ID}`, {
+    headers: { 'User-Agent': BROWSER_UA },
+  });
+  if (!res.ok) throw new Error('YouTube RSS ' + res.status);
+  const xml = await res.text();
+  const entryMatch = xml.match(/<entry>[\s\S]*?<\/entry>/);
+  if (!entryMatch) throw new Error('No entries in feed');
+  const entry = entryMatch[0];
+  const videoId = entry.match(/<yt:videoId>(.*?)<\/yt:videoId>/)?.[1];
+  const titleRaw = entry.match(/<title>([\s\S]*?)<\/title>/)?.[1];
+  const published = entry.match(/<published>(.*?)<\/published>/)?.[1];
+  if (!videoId || !titleRaw) throw new Error('Could not parse feed entry (page format may have changed)');
+  return { videoId, title: decodeHtmlEntities(titleRaw.trim()), published, url: `https://www.youtube.com/watch?v=${videoId}` };
+}
+
+async function fetchYouTubeTranscript(videoId) {
+  const watchRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.5' },
+  });
+  if (!watchRes.ok) throw new Error('YouTube watch page ' + watchRes.status);
+  const html = await watchRes.text();
+
+  const marker = 'ytInitialPlayerResponse = ';
+  const startIdx = html.indexOf(marker);
+  if (startIdx === -1) return { status: 'unavailable', text: null, lang: null, error: 'ytInitialPlayerResponse marker not found (page format may have changed)' };
+  const jsonStart = startIdx + marker.length;
+  // Bracket-depth counting rather than a regex boundary — this blob is large
+  // and can contain "};" inside strings (e.g. video descriptions), which a
+  // naive regex would cut on incorrectly.
+  let depth = 0, endIdx = -1;
+  for (let i = jsonStart; i < html.length; i++) {
+    const ch = html[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) { endIdx = i + 1; break; } }
+  }
+  if (endIdx === -1) return { status: 'unavailable', text: null, lang: null, error: 'Could not isolate player response JSON' };
+
+  let playerResponse;
+  try {
+    playerResponse = JSON.parse(html.slice(jsonStart, endIdx));
+  } catch (e) {
+    return { status: 'unavailable', text: null, lang: null, error: 'player response JSON.parse failed: ' + e.message };
+  }
+
+  const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!tracks || !tracks.length) return { status: 'unavailable', text: null, lang: null, error: 'no captionTracks on this video' };
+
+  // Prefer a manually-authored French track over auto-generated (kind:'asr'),
+  // then any French variant, then whatever exists rather than failing outright.
+  const pick = tracks.find(t => t.languageCode === 'fr' && t.kind !== 'asr')
+    || tracks.find(t => t.languageCode === 'fr')
+    || tracks.find(t => (t.languageCode || '').startsWith('fr'))
+    || tracks[0];
+
+  const capRes = await fetch(pick.baseUrl, { headers: { 'User-Agent': BROWSER_UA } });
+  if (!capRes.ok) return { status: 'unavailable', text: null, lang: pick.languageCode, error: 'caption track fetch ' + capRes.status };
+  const capXml = await capRes.text();
+  const text = [...capXml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)]
+    .map(m => decodeHtmlEntities(m[1]))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return { status: 'unavailable', text: null, lang: pick.languageCode, error: 'caption track was empty after parsing' };
+  return { status: 'ok', text, lang: pick.languageCode, kind: pick.kind === 'asr' ? 'auto-generated' : 'manual' };
+}
+
 // ---------- Telegram ----------
 async function sendTelegram(env, text) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
@@ -1340,6 +1428,112 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
         return new Response(JSON.stringify({ analysis: narrative, narrativeScores, ts: Date.now() }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
+      }
+    }
+
+    // ---- GET /foufi-check?force=1 — TEST ROUTE, not yet wired to any UI.
+    // Checks Foufi's YouTube channel for its latest video, pulls the French
+    // transcript (unofficial — see fetchYouTubeTranscript above), and asks
+    // Gemini to extract only what he actually said, structured around his
+    // own 5-point framework (the same one that shaped this app's Sentiment
+    // Engine / Regime Scorecard). Deliberately constrained to the transcript
+    // content only — no outside-knowledge synthesis, unlike /gemini-outlook —
+    // this is meant to report what Foufi said, not what Gemini thinks.
+    // ?force=1 bypasses the "already processed" check, for manual testing. ----
+    if (url.pathname === '/foufi-check' && request.method === 'GET') {
+      if (!env.GEMINI_API_KEY) {
+        return new Response(JSON.stringify({ error: 'GEMINI_API_KEY not configured on this Worker' }), { status: 500, headers: corsHeaders });
+      }
+      const force = url.searchParams.get('force') === '1';
+      try {
+        const video = await fetchLatestFoufiVideo();
+
+        if (!force) {
+          const existing = await env.DB.prepare('SELECT video_id FROM foufi_digest WHERE video_id = ?').bind(video.videoId).first();
+          if (existing) {
+            return new Response(JSON.stringify({ ok: true, skipped: true, reason: 'already processed', video }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          }
+        }
+
+        const transcript = await fetchYouTubeTranscript(video.videoId);
+
+        let summaryJson = null, overallLean = null, geminiError = null;
+        if (transcript.status === 'ok') {
+          try {
+            const capped = transcript.text.length > 15000 ? transcript.text.slice(0, 15000) + '...' : transcript.text;
+            const prompt = `You are extracting a structured summary from a French-language crypto YouTube video transcript by the analyst "Foufi". Summarize ONLY what is actually said in the transcript below — do not add outside knowledge, do not speculate beyond what is stated, and say plainly "not addressed in this video" for any category he doesn't cover rather than inventing content for it.
+
+TRANSCRIPT (French, auto/manual captions, may contain minor transcription errors):
+"""
+${capped}
+"""
+
+Respond in English. Plain text only (no markdown symbols). Follow this exact structure and order:
+
+Macro/Geopolitical: [what Foufi said about macro conditions, central banks, geopolitics, or "not addressed in this video"]
+TradFi correlation: [what he said linking crypto to stocks/traditional markets, or "not addressed"]
+Technical (Ichimoku/MA): [his technical read - levels, trend, key indicators mentioned, or "not addressed"]
+Liquidity/Sentiment: [his read on market sentiment, liquidity, funding, positioning, or "not addressed"]
+On-chain/Institutional flow: [what he said about on-chain data, ETF flows, institutional activity, or "not addressed"]
+Overall lean: [one word only: bullish, bearish, or neutral - his overall tone in this specific video]
+
+On its own final line, nothing else on it:
+FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","onchain":"...","lean":"bullish|bearish|neutral"}`;
+
+            const geminiRes = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+                body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+              }
+            );
+            if (!geminiRes.ok) {
+              const errBody = await geminiRes.text();
+              throw new Error(`Gemini API ${geminiRes.status}: ${errBody.slice(0, 300)}`);
+            }
+            const geminiJsonRes = await geminiRes.json();
+            const text = geminiJsonRes?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) throw new Error('Empty or unexpected Gemini response shape: ' + JSON.stringify(geminiJsonRes).slice(0, 300));
+            const match = text.match(/FOUFI_JSON:\s*(\{[\s\S]*\})\s*$/);
+            if (match) {
+              try { summaryJson = JSON.parse(match[1]); overallLean = summaryJson.lean || null; }
+              catch (e) { summaryJson = { raw: text.trim(), parseError: e.message }; }
+            } else {
+              summaryJson = { raw: text.trim() };
+            }
+          } catch (err) {
+            geminiError = err.message;
+          }
+        }
+
+        const now = Date.now();
+        await env.DB.prepare(
+          'INSERT OR REPLACE INTO foufi_digest (video_id, published_ts, title, url, transcript_status, summary_json, overall_lean, fetched_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(
+          video.videoId,
+          video.published ? new Date(video.published).getTime() : null,
+          video.title,
+          video.url,
+          transcript.status,
+          summaryJson ? JSON.stringify(summaryJson) : null,
+          overallLean,
+          now
+        ).run();
+
+        return new Response(JSON.stringify({
+          ok: true,
+          video,
+          transcriptStatus: transcript.status,
+          transcriptError: transcript.error || null,
+          transcriptLang: transcript.lang || null,
+          transcriptKind: transcript.kind || null,
+          transcriptChars: transcript.text ? transcript.text.length : 0,
+          geminiError,
+          summary: summaryJson,
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
       }
