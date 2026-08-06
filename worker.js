@@ -1499,6 +1499,28 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
     // returns the most recently stored digest row; never triggers a Gemini
     // call itself (that only happens via checkFoufiDigest, from the hourly
     // cron or the manual /foufi-check route). ----
+    // ---- GET /foufi-list — diagnostic only, no Gemini cost. Lists recent
+    // entries straight from the channel RSS (title/videoId/published) so we
+    // can see real posting-time/title patterns without processing every
+    // video through Gemini just to look at metadata. ----
+    if (url.pathname === '/foufi-list' && request.method === 'GET') {
+      try {
+        const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${FOUFI_CHANNEL_ID}`, { headers: { 'User-Agent': BROWSER_UA } });
+        if (!res.ok) throw new Error('YouTube RSS ' + res.status);
+        const xml = await res.text();
+        const entries = [...xml.matchAll(/<entry>[\s\S]*?<\/entry>/g)].map(m => {
+          const entry = m[0];
+          const videoId = entry.match(/<yt:videoId>(.*?)<\/yt:videoId>/)?.[1];
+          const titleRaw = entry.match(/<title>([\s\S]*?)<\/title>/)?.[1];
+          const published = entry.match(/<published>(.*?)<\/published>/)?.[1];
+          return { videoId, title: titleRaw ? decodeHtmlEntities(titleRaw.trim()) : null, published };
+        });
+        return new Response(JSON.stringify({ entries }), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
+      }
+    }
+
     if (url.pathname === '/foufi-latest' && request.method === 'GET') {
       try {
         const row = await env.DB.prepare('SELECT * FROM foufi_digest ORDER BY fetched_ts DESC LIMIT 1').first();
