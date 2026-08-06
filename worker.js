@@ -252,8 +252,14 @@ async function checkFoufiDigest(env, { force = false, videoOverride = null } = {
       : await fetchLatestFoufiVideo();
 
     if (!force) {
-      const existing = await env.DB.prepare('SELECT video_id FROM foufi_digest WHERE video_id = ?').bind(video.videoId).first();
-      if (existing) return { ok: true, skipped: true, reason: 'already processed', video };
+      // Only 'ok' (and 'unstructured' — Gemini answered, just not in the
+      // expected shape, so retrying won't help) count as "already handled".
+      // A prior 'error' (e.g. a transient Gemini 503) must NOT block a
+      // retry, or the hourly cron would permanently skip any video that
+      // happened to hit a transient failure on its first pass — silently,
+      // with no future attempt ever made again.
+      const existing = await env.DB.prepare('SELECT video_id, transcript_status FROM foufi_digest WHERE video_id = ?').bind(video.videoId).first();
+      if (existing && existing.transcript_status !== 'error') return { ok: true, skipped: true, reason: 'already processed', video };
     }
 
     const { videoType, specialEdition } = classifyFoufiVideo(video.published);
