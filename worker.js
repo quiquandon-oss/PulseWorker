@@ -212,51 +212,52 @@ async function fetchLatestFoufiVideo() {
 }
 
 async function fetchYouTubeTranscript(videoId) {
-  // Lighter than scraping the full watch page (~1-2MB of HTML) for the
-  // embedded ytInitialPlayerResponse blob: this lists caption tracks
-  // directly via YouTube's timedtext listing endpoint. Smaller, fewer
-  // requests, less bot-like — worth trying first if the heavier scrape
-  // starts hitting rate limits from Workers' shared IP ranges (the same
-  // class of problem already diagnosed for CoinGecko in this codebase).
-  const listRes = await fetch(`https://www.youtube.com/api/timedtext?type=list&v=${videoId}`, {
-    headers: { 'User-Agent': BROWSER_UA },
+  // Third approach: /api/timedtext?type=list came back empty for every video
+  // tested (including a 3-week-old one that definitely has captions) —
+  // that endpoint appears to be dead, not rate-limited. This calls the
+  // Innertube player API directly instead — the same internal API every
+  // youtube.com page load uses to fetch player data, reached here without
+  // downloading the full watch page HTML. The key below is the public WEB
+  // client key baked into every YouTube page's JS (not a secret credential,
+  // just a client identifier — the same one yt-dlp and similar tools use).
+  const INNERTUBE_API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+  const playerRes = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': BROWSER_UA },
+    body: JSON.stringify({
+      videoId,
+      context: { client: { clientName: 'WEB', clientVersion: '2.20240101.00.00' } },
+    }),
   });
-  if (!listRes.ok) return { status: 'unavailable', text: null, lang: null, error: 'timedtext list ' + listRes.status };
-  const listXml = await listRes.text();
-  const trackMatches = [...listXml.matchAll(/<track\s+([^>]*)\/?>/g)].map(m => {
-    const attrs = {};
-    for (const am of m[1].matchAll(/(\w+)="([^"]*)"/g)) attrs[am[1]] = decodeHtmlEntities(am[2]);
-    return attrs;
-  });
-  if (!trackMatches.length) {
-    // Debug aid for this test phase: distinguish "genuinely no captions yet"
-    // (very recent upload — YouTube's auto-captions can lag hours behind
-    // publish) from "my parsing assumption about this endpoint's response
-    // shape is wrong" — those need different fixes.
-    return { status: 'unavailable', text: null, lang: null, error: 'no caption tracks listed for this video', debugListLength: listXml.length, debugListSnippet: listXml.slice(0, 400) };
+  if (!playerRes.ok) return { status: 'unavailable', lang: null, error: 'innertube player ' + playerRes.status };
+  const playerJson = await playerRes.json();
+  const tracks = playerJson?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!tracks || !tracks.length) {
+    return {
+      status: 'unavailable', lang: null, error: 'no captionTracks in innertube player response',
+      debugPlaybackStatus: playerJson?.playabilityStatus?.status ?? null,
+      debugPlaybackReason: playerJson?.playabilityStatus?.reason ?? null,
+      debugTopLevelKeys: Object.keys(playerJson || {}),
+    };
   }
 
   // Prefer a manually-authored French track over auto-generated (kind:'asr'),
   // then any French variant, then whatever exists rather than failing outright.
-  const pick = trackMatches.find(t => t.lang_code === 'fr' && t.kind !== 'asr')
-    || trackMatches.find(t => t.lang_code === 'fr')
-    || trackMatches.find(t => (t.lang_code || '').startsWith('fr'))
-    || trackMatches[0];
+  const pick = tracks.find(t => t.languageCode === 'fr' && t.kind !== 'asr')
+    || tracks.find(t => t.languageCode === 'fr')
+    || tracks.find(t => (t.languageCode || '').startsWith('fr'))
+    || tracks[0];
 
-  let capUrl = `https://www.youtube.com/api/timedtext?lang=${encodeURIComponent(pick.lang_code)}&v=${videoId}`;
-  if (pick.kind) capUrl += `&kind=${encodeURIComponent(pick.kind)}`;
-  if (pick.name) capUrl += `&name=${encodeURIComponent(pick.name)}`;
-
-  const capRes = await fetch(capUrl, { headers: { 'User-Agent': BROWSER_UA } });
-  if (!capRes.ok) return { status: 'unavailable', text: null, lang: pick.lang_code, error: 'caption content fetch ' + capRes.status };
+  const capRes = await fetch(pick.baseUrl, { headers: { 'User-Agent': BROWSER_UA } });
+  if (!capRes.ok) return { status: 'unavailable', lang: pick.languageCode, error: 'caption content fetch ' + capRes.status };
   const capXml = await capRes.text();
   const text = [...capXml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)]
     .map(m => decodeHtmlEntities(m[1]))
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (!text) return { status: 'unavailable', text: null, lang: pick.lang_code, error: 'caption track was empty after parsing' };
-  return { status: 'ok', text, lang: pick.lang_code, kind: pick.kind === 'asr' ? 'auto-generated' : 'manual' };
+  if (!text) return { status: 'unavailable', lang: pick.languageCode, error: 'caption track was empty after parsing', debugCapLength: capXml.length, debugCapSnippet: capXml.slice(0, 300) };
+  return { status: 'ok', text, lang: pick.languageCode, kind: pick.kind === 'asr' ? 'auto-generated' : 'manual' };
 }
 
 // ---------- Telegram ----------
@@ -1528,12 +1529,10 @@ FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","o
           ok: true,
           video,
           transcriptStatus: transcript.status,
-          transcriptError: transcript.error || null,
           transcriptLang: transcript.lang || null,
           transcriptKind: transcript.kind || null,
           transcriptChars: transcript.text ? transcript.text.length : 0,
-          transcriptDebugListLength: transcript.debugListLength ?? null,
-          transcriptDebugListSnippet: transcript.debugListSnippet ?? null,
+          transcriptDebug: Object.fromEntries(Object.entries(transcript).filter(([k]) => !['status', 'lang', 'kind', 'text'].includes(k))),
           geminiError,
           summary: summaryJson,
         }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
