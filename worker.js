@@ -1412,7 +1412,7 @@ Only ever use the words bullish, bearish, or neutral as values. Neutral is a rea
         if (!force) {
           const existing = await env.DB.prepare('SELECT video_id FROM foufi_digest WHERE video_id = ?').bind(video.videoId).first();
           if (existing) {
-            return new Response(JSON.stringify({ ok: true, skipped: true, reason: 'already processed', video }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+            return new Response(JSON.stringify({ ok: true, skipped: true, reason: 'already processed', video }), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
           }
         }
 
@@ -1487,7 +1487,7 @@ FOUFI_JSON: {"macro":"...","tradfi":"...","technical":"...","liquidity":"...","o
           status,
           geminiError,
           summary: summaryJson,
-        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
       }
