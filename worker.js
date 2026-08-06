@@ -177,13 +177,14 @@ function parseRssTitles(xml, sourceName) {
 // TEST-PHASE NOTE: unlike the RSS proxies above (official feeds, stable
 // format), this reverse-engineers two undocumented YouTube surfaces the same
 // way open-source transcript tools do: the channel RSS (documented-ish,
-// stable) for "is there a new video", and the ytInitialPlayerResponse blob
-// embedded in the watch page (NOT documented, can shift) for the actual
-// caption track URL. Every step fails gracefully into a status string rather
-// than throwing past this function, same discipline as the rest of this file
-// — but this is the one part of this Worker never yet tested against live
-// YouTube (Cloudflare Workers aren't reachable from the dev sandbox that
-// wrote this), so the first real /foufi-check call is the real test.
+// stable) for "is there a new video", and the timedtext listing/content
+// endpoints (NOT documented, can shift) for the actual transcript. First
+// attempt scraped the full watch page for an embedded JSON blob and hit a
+// 429 from YouTube — same class of shared-IP rate-limiting already diagnosed
+// for CoinGecko in this codebase. Switched to the lighter timedtext
+// endpoints below (no full page download) as a cheaper first fix to try
+// before assuming this needs the client-side-fetch treatment CoinGecko got.
+// Every step fails gracefully into a status string rather than throwing.
 function decodeHtmlEntities(s) {
   return s
     .replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
@@ -211,54 +212,45 @@ async function fetchLatestFoufiVideo() {
 }
 
 async function fetchYouTubeTranscript(videoId) {
-  const watchRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.5' },
+  // Lighter than scraping the full watch page (~1-2MB of HTML) for the
+  // embedded ytInitialPlayerResponse blob: this lists caption tracks
+  // directly via YouTube's timedtext listing endpoint. Smaller, fewer
+  // requests, less bot-like — worth trying first if the heavier scrape
+  // starts hitting rate limits from Workers' shared IP ranges (the same
+  // class of problem already diagnosed for CoinGecko in this codebase).
+  const listRes = await fetch(`https://www.youtube.com/api/timedtext?type=list&v=${videoId}`, {
+    headers: { 'User-Agent': BROWSER_UA },
   });
-  if (!watchRes.ok) throw new Error('YouTube watch page ' + watchRes.status);
-  const html = await watchRes.text();
-
-  const marker = 'ytInitialPlayerResponse = ';
-  const startIdx = html.indexOf(marker);
-  if (startIdx === -1) return { status: 'unavailable', text: null, lang: null, error: 'ytInitialPlayerResponse marker not found (page format may have changed)' };
-  const jsonStart = startIdx + marker.length;
-  // Bracket-depth counting rather than a regex boundary — this blob is large
-  // and can contain "};" inside strings (e.g. video descriptions), which a
-  // naive regex would cut on incorrectly.
-  let depth = 0, endIdx = -1;
-  for (let i = jsonStart; i < html.length; i++) {
-    const ch = html[i];
-    if (ch === '{') depth++;
-    else if (ch === '}') { depth--; if (depth === 0) { endIdx = i + 1; break; } }
-  }
-  if (endIdx === -1) return { status: 'unavailable', text: null, lang: null, error: 'Could not isolate player response JSON' };
-
-  let playerResponse;
-  try {
-    playerResponse = JSON.parse(html.slice(jsonStart, endIdx));
-  } catch (e) {
-    return { status: 'unavailable', text: null, lang: null, error: 'player response JSON.parse failed: ' + e.message };
-  }
-
-  const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  if (!tracks || !tracks.length) return { status: 'unavailable', text: null, lang: null, error: 'no captionTracks on this video' };
+  if (!listRes.ok) return { status: 'unavailable', text: null, lang: null, error: 'timedtext list ' + listRes.status };
+  const listXml = await listRes.text();
+  const trackMatches = [...listXml.matchAll(/<track\s+([^>]*)\/?>/g)].map(m => {
+    const attrs = {};
+    for (const am of m[1].matchAll(/(\w+)="([^"]*)"/g)) attrs[am[1]] = decodeHtmlEntities(am[2]);
+    return attrs;
+  });
+  if (!trackMatches.length) return { status: 'unavailable', text: null, lang: null, error: 'no caption tracks listed for this video' };
 
   // Prefer a manually-authored French track over auto-generated (kind:'asr'),
   // then any French variant, then whatever exists rather than failing outright.
-  const pick = tracks.find(t => t.languageCode === 'fr' && t.kind !== 'asr')
-    || tracks.find(t => t.languageCode === 'fr')
-    || tracks.find(t => (t.languageCode || '').startsWith('fr'))
-    || tracks[0];
+  const pick = trackMatches.find(t => t.lang_code === 'fr' && t.kind !== 'asr')
+    || trackMatches.find(t => t.lang_code === 'fr')
+    || trackMatches.find(t => (t.lang_code || '').startsWith('fr'))
+    || trackMatches[0];
 
-  const capRes = await fetch(pick.baseUrl, { headers: { 'User-Agent': BROWSER_UA } });
-  if (!capRes.ok) return { status: 'unavailable', text: null, lang: pick.languageCode, error: 'caption track fetch ' + capRes.status };
+  let capUrl = `https://www.youtube.com/api/timedtext?lang=${encodeURIComponent(pick.lang_code)}&v=${videoId}`;
+  if (pick.kind) capUrl += `&kind=${encodeURIComponent(pick.kind)}`;
+  if (pick.name) capUrl += `&name=${encodeURIComponent(pick.name)}`;
+
+  const capRes = await fetch(capUrl, { headers: { 'User-Agent': BROWSER_UA } });
+  if (!capRes.ok) return { status: 'unavailable', text: null, lang: pick.lang_code, error: 'caption content fetch ' + capRes.status };
   const capXml = await capRes.text();
   const text = [...capXml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)]
     .map(m => decodeHtmlEntities(m[1]))
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (!text) return { status: 'unavailable', text: null, lang: pick.languageCode, error: 'caption track was empty after parsing' };
-  return { status: 'ok', text, lang: pick.languageCode, kind: pick.kind === 'asr' ? 'auto-generated' : 'manual' };
+  if (!text) return { status: 'unavailable', text: null, lang: pick.lang_code, error: 'caption track was empty after parsing' };
+  return { status: 'ok', text, lang: pick.lang_code, kind: pick.kind === 'asr' ? 'auto-generated' : 'manual' };
 }
 
 // ---------- Telegram ----------
