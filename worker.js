@@ -289,8 +289,18 @@ HYPE: [same]
 
 Score scale for each coin: -2 very bearish, -1 bearish, 0 neutral, +1 bullish, +2 very bullish — based on his stated view for THAT coin specifically, not the market overall. Most videos only address BTC and sometimes ETH — leaving the others "not addressed" is the normal, expected case, not a failure.
 
+Dominant short-term driver: [macro, tradfi, micro, or none — see definitions below]
+Secondary driver: [same options, or none — only if a second distinct factor was also clearly in play]
+
+These two fields are about what will move price in the NEXT FEW HOURS, not medium-term narratives. Concretely:
+- macro = central bank decisions/signals, rate expectations, inflation prints, FX moves, geopolitical shocks (e.g. a surprise Fed comment, a Middle East escalation, a surprise CPI print)
+- tradfi = a stock index or broad equity move dragging crypto with it (e.g. S&P 500 hitting a record high, a Nasdaq selloff, an equity-market risk-on/risk-off shift)
+- micro = a single company's earnings or stock move creating an immediate ripple (e.g. a specific AI-stock earnings shock, a single liquidation cascade)
+- none = no single identifiable short-term catalyst, or the video's tone was driven by pure technical levels
+Do NOT use "macro" for adoption, partnership, infrastructure, or regulatory-approval news (e.g. a company acquiring a stablecoin business, an ETF approval) — these are real but they are multi-week stories, not next-few-hours price drivers. Leave both fields "none" rather than force-fitting a story that isn't actually a short-term catalyst.
+
 On its own final line, nothing else on it:
-FOUFI_JSON: {"market_summary":"...","macro":{"lean":"bullish|bearish|neutral","text":"..."},"micro":{"lean":"bullish|bearish|neutral","text":"..."},"tradfi":{"lean":"bullish|bearish|neutral","text":"..."},"coins":{"BTC":{"score":-2,"note":"..."},"ETH":{"score":null,"note":"not addressed in this video"},"SOL":{"score":null,"note":"..."},"LINK":{"score":null,"note":"..."},"HYPE":{"score":null,"note":"..."}}}`;
+FOUFI_JSON: {"market_summary":"...","macro":{"lean":"bullish|bearish|neutral","text":"..."},"micro":{"lean":"bullish|bearish|neutral","text":"..."},"tradfi":{"lean":"bullish|bearish|neutral","text":"..."},"coins":{"BTC":{"score":-2,"note":"..."},"ETH":{"score":null,"note":"not addressed in this video"},"SOL":{"score":null,"note":"..."},"LINK":{"score":null,"note":"..."},"HYPE":{"score":null,"note":"..."}},"dominant_driver":"macro|tradfi|micro|none","secondary_driver":"macro|tradfi|micro|none"}`;
 
       const geminiRes = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
