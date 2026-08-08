@@ -1117,6 +1117,43 @@ RULES:
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
       }
     }
+
+    // ---- POST /portfolio-log — persists a total-portfolio-value snapshot
+    // the client already computed (same "log what's already being fetched/
+    // computed" principle as /whale-log), enabling a genuine intraday 24H
+    // chart. This is a NEW, fully separate table from anything the existing
+    // 1W/1M/3M/YTD/All views use (those stay computed live client-side from
+    // transaction history + historical daily prices, completely untouched
+    // by this) — purely additive, cannot affect the existing daily views
+    // even if this table were empty or wrong. Stores both USD and EUR at
+    // log time (not just one, converted later) so the 24H chart can switch
+    // currency without needing a live FX rate applied to historical points. ----
+    if (url.pathname === '/portfolio-log' && request.method === 'POST') {
+      try {
+        const { value_usd, value_eur, fx } = await request.json();
+        if (value_usd == null) throw new Error('value_usd required');
+        await env.DB.prepare(
+          'INSERT INTO portfolio_snapshots (ts, value_usd, value_eur, fx) VALUES (?,?,?,?)'
+        ).bind(Date.now(), value_usd, value_eur ?? null, fx ?? null).run();
+        return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // ---- GET /portfolio-history?hours=N — raw snapshots for the 24H chart. ----
+    if (url.pathname === '/portfolio-history' && request.method === 'GET') {
+      try {
+        const hours = Math.min(168, parseInt(url.searchParams.get('hours') || '24', 10));
+        const since = Date.now() - hours * 3600000;
+        const { results } = await env.DB.prepare(
+          'SELECT ts, value_usd, value_eur FROM portfolio_snapshots WHERE ts >= ? ORDER BY ts ASC'
+        ).bind(since).all();
+        return new Response(JSON.stringify({ points: results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
     // modeled liquidation levels (leverage-tier calculation on real
     // Hyperliquid mark price + funding), the crowding/elevated flags, and the
     // monthly persistence check — all already computed by CryptoPulse, the
