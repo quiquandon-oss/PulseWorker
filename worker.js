@@ -173,6 +173,151 @@ function parseRssTitles(xml, sourceName) {
   return items;
 }
 
+// ---------- Trader Analysis: shared data-block builder + prompt rules ----------
+// Extracted so BOTH /trader-analysis (fast Llama, constrained purely to
+// given numbers) and /trader-analysis-gemini (Gemini, same numbers PLUS
+// permission to supplement with its own broader knowledge) work from
+// byte-identical data and byte-identical correction rules — genuinely
+// comparable independent reads of the same snapshot, not two differently-
+// scoped analyses that happen to look similar.
+function buildTraderAnalysisDataBlock(data) {
+  const fmt = (v, d = 2) => v == null ? 'N/A' : (typeof v === 'number' ? v.toFixed(d) : String(v));
+  const sourcesLines = Object.entries(data.sentiment?.sources || {}).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+  const corrLines = Object.entries(data.sourceCorrelations?.perSourceCorrelation || data.sourceCorrelations?.perSource || {})
+    .map(([k, v]) => `  ${k}: ${fmt(v && typeof v === 'object' ? v.correlation : v)}`).join('\n');
+  const t = data.technicals || {};
+  const pm = data.probabilityModel || {};
+  const btn = data.buyTheNews || {};
+  const lc = data.liquidationClusters || null;
+  const distPct = (target, live) => (target == null || live == null) ? null : ((target / live - 1) * 100);
+  let liqLines = 'Not available this session.';
+  if (lc) {
+    const distAbove = distPct(lc.nextClusterAbove, lc.livePrice);
+    const distBelow = distPct(lc.nextClusterBelow, lc.livePrice);
+    const aboveTxt = lc.nextClusterAbove != null
+      ? `Next cluster ABOVE: $${fmt(lc.nextClusterAbove, 0)} (${fmt(Math.abs(distAbove), 1)}% higher). Modeled P(reach within ${lc.horizonDays}-day horizon) = ${Math.round((lc.probAbove || 0) * 100)}%. ${lc.calibrationAbove ? `Historically, similar predictions have actually hit ${Math.round(lc.calibrationAbove.empiricalRate * 100)}% of the time (${lc.calibrationAbove.count} comparable past case(s)).` : "Not enough resolved history yet to check this model's accuracy."}`
+      : 'No cluster above within range.';
+    const belowTxt = lc.nextClusterBelow != null
+      ? `Next cluster BELOW: $${fmt(lc.nextClusterBelow, 0)} (${fmt(Math.abs(distBelow), 1)}% lower). Modeled P(reach within ${lc.horizonDays}-day horizon) = ${Math.round((lc.probBelow || 0) * 100)}%. ${lc.calibrationBelow ? `Historically, similar predictions have actually hit ${Math.round(lc.calibrationBelow.empiricalRate * 100)}% of the time (${lc.calibrationBelow.count} comparable past case(s)).` : "Not enough resolved history yet to check this model's accuracy."}`
+      : 'No cluster below within range.';
+    const crowdTxt = lc.crowded
+      ? `${lc.crowdedSide === 'long' ? 'Longs' : 'Shorts'} are crowded today, nearest relevant level about ${fmt(lc.nearestDistPct, 1)}% away.`
+      : 'Crowding is balanced today, neither side is more exposed than the other.';
+    const monthlyTxt = lc.monthly
+      ? `This crowding direction has been dominant in ${lc.monthly.pct}% of the last ${lc.monthly.count} logged reading(s).`
+      : 'Not enough logged history yet to say if this crowding direction is new or sustained over time.';
+    liqLines = `${aboveTxt}\n${belowTxt}\n${crowdTxt} ${monthlyTxt}`;
+  }
+  const wa = data.whaleActivity || null;
+  let waLines = null;
+  if (wa) {
+    const c = wa.concentration || {};
+    const flagsTxt = (c.flags || []).map(f => f.type === 'concentration'
+      ? `${f.count} transfers concentrated at ${f.exchange}`
+      : `bidirectional flow at ${f.exchange} (in $${((f.inflowUsd || 0) / 1e6).toFixed(1)}M / out $${((f.outflowUsd || 0) / 1e6).toFixed(1)}M)`
+    ).join('; ') || 'none flagged';
+    const topTxt = (wa.transfers || []).slice(0, 5).map(tr =>
+      `  ${tr.symbol} $${(tr.usd / 1e6).toFixed(1)}M ${tr.direction === 'outflow' ? 'OUT of' : 'INTO'} an exchange (${tr.from} -> ${tr.to})`
+    ).join('\n');
+    waLines = `Total tracked transfer volume this snapshot: $${((c.totalUsd || 0) / 1e6).toFixed(1)}M${c.highVolume ? ' (above the disclosed high-volume floor)' : ''}.
+Pattern flags: ${flagsTxt}.
+Largest transfers:
+${topTxt || '  (none)'}`;
+  }
+
+  const nm = data.nineMagFlags || [];
+  const nineMagLines = nm.length ? nm.map(f =>
+    `  ${f.sym} (${f.name}) moved ${f.pct >= 0 ? '+' : ''}${fmt(f.pct, 1)}% today.${f.headline ? ` Headline found: "${f.headline}".` : ' No headline found for this move.'}`
+  ).join('\n') : null;
+
+  return `PRICE: $${fmt(data.price, 0)}
+
+SENTIMENT - composite: ${fmt(data.sentiment?.composite, 0)}/100
+Raw sources:
+${sourcesLines || '  (none)'}
+
+SOURCE-VS-BTC CORRELATION (composite: ${fmt(data.sourceCorrelations?.compositeCorrelation)})
+${corrLines || '  (none)'}
+
+TECHNICALS
+Tenkan: $${fmt(t.tenkan, 0)} - Kijun: $${fmt(t.kijun, 0)} - MA50: $${fmt(t.ma50, 0)} - MA100: $${fmt(t.ma100, 0)} - MA200: $${fmt(t.ma200, 0)}
+RSI(14): ${fmt(t.rsi14, 1)}
+Ichimoku Cloud: ${t.cloud?.position || 'N/A'} (Senkou A $${fmt(t.cloud?.senkouA, 0)} / B $${fmt(t.cloud?.senkouB, 0)})
+Volume: ${t.volume?.trend || 'N/A'}
+MA Crossover: ${t.maCrossover?.type ? `${t.maCrossover.type} cross, ${t.maCrossover.daysAgo} day(s) ago` : 'none in window'}
+Swing structure: ${t.swingStructure || 'N/A'}
+RSI/Price divergence: ${t.divergence?.type || 'none'}
+
+LIQUIDATION CLUSTERS (Hyperliquid-modeled, BTC-focused - only present if the Liquidation tab was visited this session with BTC focused; if absent, do not mention liquidation clusters at all)
+${liqLines}
+
+WHALE ACTIVITY (large exchange-flow transfers - only ever present when high current volatility has been detected client-side; if absent, do NOT mention whale activity, volatility being high or low, or speculate about either)
+${waLines || 'Not applicable right now - high volatility not currently detected, or whale data not fetched this session.'}
+
+PROBABILITY MODEL (frequency-based, NOT a guess)
+${pm.insufficient ? `Insufficient data (${pm.n || 0} matches) - do not state a probability, say so plainly.` : `${Math.round((pm.probUp || 0) * 100)}% of ${pm.n} historically comparable day(s) (bucket ${pm.bucket}-${(pm.bucket || 0) + 20}) saw BTC higher 7 days later.`}
+
+BUY THE NEWS VS PRICED IN
+Mechanism 1 (actual vs typical reaction): sentiment shift ${fmt(btn.reaction?.sentimentShift, 1)}, actual move ${fmt(btn.reaction?.actualPriceChange)}%, typical move for similar shifts ${fmt(btn.reaction?.typicalChange)}%. Read: ${btn.reaction?.read || 'insufficient data'}
+Mechanism 2 (multi-lag correlation pattern): ${(btn.lagPattern?.corrs || []).map(c => `${c.lag}h=${fmt(c.corr)}`).join(', ') || 'insufficient data'}. Read: ${btn.lagPattern?.read || 'insufficient data'}
+
+REGIME SCORECARD (from the Cycles tab — only present if that tab was visited this session; if absent, do not speculate about it)
+${data.regimeScorecard ? `Overall: ${data.regimeScorecard.bullCount}/${data.regimeScorecard.total} bullish, ${data.regimeScorecard.bearCount}/${data.regimeScorecard.total} bearish - ${data.regimeScorecard.overallLabel}
+Short-term (days): ${(data.regimeScorecard.shortTerm || []).map(f => `${f.label}=${f.display} (${f.tag})`).join(', ')}
+Medium-term (weeks): ${(data.regimeScorecard.midTerm || []).map(f => `${f.label}=${f.display} (${f.tag})`).join(', ')}
+Long-term (months+): ${(data.regimeScorecard.longTerm || []).map(f => `${f.label}=${f.display} (${f.tag})`).join(', ')}
+EVENT CALENDAR (CONFIDENCE MODIFIER ONLY — this does not vote bullish or bearish, it only affects how much weight to put on the short-term reads above): ${data.regimeScorecard.eventCalendar?.daysUntilFOMC != null ? `FOMC decision in ${data.regimeScorecard.eventCalendar.daysUntilFOMC} day(s).${data.regimeScorecard.eventCalendar.confidenceReduced ? ' This is close enough that short-term reads may just be pre-FOMC positioning, not organic trend — say so explicitly, do not treat this as bullish or bearish.' : ''}` : 'No FOMC date data available.'}` : 'Not available this session.'}
+
+ON-CHAIN VS PRICE (CoinMetrics active addresses, 30d trend, vs BTC price trend over the same window)
+${data.onChainDivergence ? `${data.onChainDivergence.label} (on-chain slope ${fmt(data.onChainDivergence.onchainSlope, 4)}, price slope ${fmt(data.onChainDivergence.priceSlope, 4)})` : 'Not available this session.'}
+
+SECTOR ROTATION (BTC's own 30d trend vs Nasdaq's 30d trend, normalized so scale doesn't matter — distinguishes "crypto-specific weakness" from "broad risk-off that's hitting everything")
+${data.sectorRotation ? `${data.sectorRotation.label} (BTC trend ${fmt(data.sectorRotation.btcSlope * 100, 3)}%/day, Nasdaq trend ${fmt(data.sectorRotation.nasdaqSlope * 100, 3)}%/day)` : 'Not available this session.'}
+
+TECHNICAL TIMEFRAME ALIGNMENT (50-WEEK EMA — a roughly one-year structural level, distinct from the 50/100/200-DAY technicals above which answer a near-term question)
+${data.technicalAlignment ? `${data.technicalAlignment.label} (price $${fmt(data.technicalAlignment.price, 0)} vs 50wk EMA $${fmt(data.technicalAlignment.ema50, 0)})` : 'Not available this session.'}
+
+TOP HEADLINES (individual news items behind the sentiment sources above, ranked by how strongly each one scored — NOT the same as the aggregate source numbers; these are the specific real headlines driving them)
+${(data.topHeadlines || []).length ? data.topHeadlines.map(h => `  [${h.category}, score ${fmt(h.score, 0)}] "${h.title}"`).join('\n') : '  (none available this cycle)'}
+
+9 MAGNIFICENT COMPANY MOVES (individual stock moves large enough to trigger a targeted news check — only present when at least one of the 9 tracked companies moved beyond +/-3.5% today; absent means none crossed that threshold this cycle)
+${nineMagLines || 'Not applicable — no individual company move crossed the threshold today.'}`;
+}
+// Shared correction rules — identical for both models. Numbered list kept
+// as one string so both prompts interpolate the exact same text rather
+// than two hand-maintained copies that could silently drift apart.
+const TRADER_ANALYSIS_RULES = `- RSI(14) interpretation: only call it "overbought" if it is ABOVE 70, and only "oversold" if BELOW 30. A value between 50-70 is healthy bullish momentum, NOT overbought — do not mislabel it. Between 30-50 is bearish momentum, NOT oversold.
+- US Dollar / USD strength direction: a WEAKENING dollar (or falling rate-hike expectations, or rising rate-cut expectations) is the standard BULLISH signal for BTC and risk assets generally — never state or imply the reverse. A STRENGTHENING dollar (or rising rate-hike expectations) is the bearish/headwind direction. Do not confuse "hike expectations falling" with something bearish — falling hike expectations is itself the bullish case, not a reason for concern.
+- If a field says "insufficient data", "N/A", or "Not available": state that plainly ONCE, then move on. Do NOT follow it with a fabricated claim about that same topic (e.g. never say "not available, but it's probably above X" — if it's not available, you have nothing to say about X, full stop).
+- Never use the internal labels "Mechanism 1" or "Mechanism 2" in your output — translate them into plain questions instead: mechanism 1 (actual vs. typical reaction) becomes something like "has this already been priced in?"; mechanism 2 (multi-lag correlation) becomes something like "is the effect still unfolding?".
+- If a conflict exists between timeframes (short/medium/long-term, or between the regime scorecard's columns), name it explicitly and explain briefly why it might be happening (e.g. crypto-native flows vs. broader macro correlation) rather than just listing both sides.
+- Before labeling any Timeframe breakdown outlook (short/medium/long-term), check it against the TECHNICALS section you already described in your own output: if price is trading above Tenkan, Kijun, and the 50-day MA (bullish technical structure) but you are labeling that timeframe bearish anyway, say explicitly what is outweighing the bullish technicals (e.g. sentiment sources pulling the other way, a regime scorecard factor, an overbought/exhaustion read) — never state a directional label that contradicts the technical structure you already described without naming the reason for the disagreement.
+- The event calendar (FOMC proximity) is a CONFIDENCE modifier only — it tempers how much weight to put on short-term reads, it is never itself bullish or bearish.
+- If sector rotation shows BTC underperforming Nasdaq, say plainly that this looks like capital rotating away from crypto specifically, not generic risk-off.
+- LIQUIDATION CLUSTERS, if present, belongs INSIDE the Technicals section (never its own heading) as 1-2 extra plain-language sentences: current price, the nearest cluster above and below with their distance in % and modeled probability of being reached within the stated horizon, and today's crowding read. State the historical hit-rate or "not enough data yet" for calibration, and the monthly persistence or "not enough logged history yet", exactly as given - never guess these when the data says they're unavailable. If LIQUIDATION CLUSTERS says "Not available this session", do not mention liquidation clusters at all.
+- WHALE ACTIVITY, if present, ALSO belongs INSIDE the Technicals section (never its own heading), as 1 extra plain-language sentence on what the large-transfer pattern suggests (e.g. exchange outflows read as accumulation/reduced sell-side supply, inflows as potential distribution, bidirectional flow at the same exchange as repositioning/uncertainty) - state only what the transfer directions and flags actually show, never invent a motive. WHALE ACTIVITY only ever appears when high volatility has genuinely been detected - if it says "Not applicable right now", do not mention whale activity, large transfers, or volatility being high or low anywhere in your output.
+- Key takeaway must explicitly factor in LIQUIDATION CLUSTERS and WHALE ACTIVITY, when present, if either points to a plausible near-term price impact (e.g. a very close and reasonably probable cluster, or whale flow reinforcing or contradicting the rest of the read) - don't force them in if neither adds anything beyond what's already said elsewhere.
+- For the Geopolitical & Macro Drivers section: use ONLY the headlines listed in TOP HEADLINES, verbatim topic (you may paraphrase the headline briefly, do not invent an event not present in that list). Pick the 3 to 5 with the largest |score|. For each, give the headline's topic in a few words and one sentence on why it plausibly matters for BTC (e.g. risk-off/risk-on transmission, inflation/rate-cut expectations, dollar strength, haven demand) — do not assert a causal price move you weren't given data for. If TOP HEADLINES is empty or says "(none available this cycle)", say plainly that no headline-level detail was available this cycle and do not invent any events.
+- 9 MAGNIFICENT COMPANY MOVES gets its own short paragraph, always present in your output (even when nothing was flagged — see below). For each flagged company: state its % move and, if a headline was found, name the likely topic in plain words. Only explain a connection to crypto sentiment as far as the OTHER data in this prompt actually supports it (e.g. the 9 Magnificent composite score in SENTIMENT sources moved the same direction around the same time, or SECTOR ROTATION shows a related pattern) — if nothing else in the data connects it, say plainly that the move is noted but no clear crypto-market linkage is visible in what you were given. Never invent a causal story. If the section says "Not applicable," write one sentence saying no individual company move crossed the threshold today — do not skip this paragraph entirely.`;
+const TRADER_ANALYSIS_OUTPUT_FORMAT = `OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this displays as raw text, not rendered markdown), structured with blank lines between sections exactly like this:
+
+[One or two sentence summary: current price, overall lean, and the single biggest reason why.]
+
+Sentiment & drivers: [2-3 sentences on composite score, which raw sources are pulling it up or down, and what that implies.]
+
+Technicals: [2-3 sentences on RSI/MAs/Ichimoku/divergence/structure, using the correct RSI interpretation above. If LIQUIDATION CLUSTERS data is present, add 1-2 more sentences folding in the nearby modeled clusters, their distance/probability, and today's crowding read - in plain everyday language, not jargon. If WHALE ACTIVITY is present, add 1 more sentence on what the large-transfer pattern suggests.]
+
+Geopolitical & Macro Drivers: [3 to 5 bullet-style lines (use a leading dash, not a markdown bullet), each naming one headline topic from TOP HEADLINES and one sentence on its plausible market impact. If none available, say so plainly in one sentence instead of a list.]
+
+9 Magnificent Watch: [1-3 sentences on any flagged company moves and their headline, explaining the likely connection to crypto sentiment based on the data given, or noting there's no clear data-supported link. If no companies were flagged this cycle, write one sentence saying no individual company move crossed the threshold today.]
+
+Timeframe breakdown:
+Short-term (7d): [outlook] - [one-line reason, mention the FOMC confidence caveat here if relevant]
+Medium-term (30-50d): [outlook] - [one-line reason]
+Long-term: [outlook, or "not enough data yet" if genuinely unavailable] - [one-line reason if available]
+
+Key takeaway: [one sentence synthesizing everything above into the single most useful thing to know right now, explicitly weighing liquidation clusters and/or whale activity when present and relevant.]`;
+
 // ---------- Foufi daily digest: YouTube RSS + unofficial transcript fetch ----------
 // TEST-PHASE NOTE: unlike the RSS proxies above (official feeds, stable
 // format), this reverse-engineers two undocumented YouTube surfaces the same
@@ -1315,143 +1460,13 @@ RULES:
     if (url.pathname === '/trader-analysis' && request.method === 'POST') {
       try {
         const data = await request.json();
-        const fmt = (v, d = 2) => v == null ? 'N/A' : (typeof v === 'number' ? v.toFixed(d) : String(v));
-        const sourcesLines = Object.entries(data.sentiment?.sources || {}).map(([k, v]) => `  ${k}: ${v}`).join('\n');
-        const corrLines = Object.entries(data.sourceCorrelations?.perSourceCorrelation || data.sourceCorrelations?.perSource || {})
-          .map(([k, v]) => `  ${k}: ${fmt(v && typeof v === 'object' ? v.correlation : v)}`).join('\n');
-        const t = data.technicals || {};
-        const pm = data.probabilityModel || {};
-        const btn = data.buyTheNews || {};
-        const lc = data.liquidationClusters || null;
-        const distPct = (target, live) => (target == null || live == null) ? null : ((target / live - 1) * 100);
-        let liqLines = 'Not available this session.';
-        if (lc) {
-          const distAbove = distPct(lc.nextClusterAbove, lc.livePrice);
-          const distBelow = distPct(lc.nextClusterBelow, lc.livePrice);
-          const aboveTxt = lc.nextClusterAbove != null
-            ? `Next cluster ABOVE: $${fmt(lc.nextClusterAbove, 0)} (${fmt(Math.abs(distAbove), 1)}% higher). Modeled P(reach within ${lc.horizonDays}-day horizon) = ${Math.round((lc.probAbove || 0) * 100)}%. ${lc.calibrationAbove ? `Historically, similar predictions have actually hit ${Math.round(lc.calibrationAbove.empiricalRate * 100)}% of the time (${lc.calibrationAbove.count} comparable past case(s)).` : "Not enough resolved history yet to check this model's accuracy."}`
-            : 'No cluster above within range.';
-          const belowTxt = lc.nextClusterBelow != null
-            ? `Next cluster BELOW: $${fmt(lc.nextClusterBelow, 0)} (${fmt(Math.abs(distBelow), 1)}% lower). Modeled P(reach within ${lc.horizonDays}-day horizon) = ${Math.round((lc.probBelow || 0) * 100)}%. ${lc.calibrationBelow ? `Historically, similar predictions have actually hit ${Math.round(lc.calibrationBelow.empiricalRate * 100)}% of the time (${lc.calibrationBelow.count} comparable past case(s)).` : "Not enough resolved history yet to check this model's accuracy."}`
-            : 'No cluster below within range.';
-          const crowdTxt = lc.crowded
-            ? `${lc.crowdedSide === 'long' ? 'Longs' : 'Shorts'} are crowded today, nearest relevant level about ${fmt(lc.nearestDistPct, 1)}% away.`
-            : 'Crowding is balanced today, neither side is more exposed than the other.';
-          const monthlyTxt = lc.monthly
-            ? `This crowding direction has been dominant in ${lc.monthly.pct}% of the last ${lc.monthly.count} logged reading(s).`
-            : 'Not enough logged history yet to say if this crowding direction is new or sustained over time.';
-          liqLines = `${aboveTxt}\n${belowTxt}\n${crowdTxt} ${monthlyTxt}`;
-        }
-        const wa = data.whaleActivity || null;
-        let waLines = null;
-        if (wa) {
-          const c = wa.concentration || {};
-          const flagsTxt = (c.flags || []).map(f => f.type === 'concentration'
-            ? `${f.count} transfers concentrated at ${f.exchange}`
-            : `bidirectional flow at ${f.exchange} (in $${((f.inflowUsd || 0) / 1e6).toFixed(1)}M / out $${((f.outflowUsd || 0) / 1e6).toFixed(1)}M)`
-          ).join('; ') || 'none flagged';
-          const topTxt = (wa.transfers || []).slice(0, 5).map(t =>
-            `  ${t.symbol} $${(t.usd / 1e6).toFixed(1)}M ${t.direction === 'outflow' ? 'OUT of' : 'INTO'} an exchange (${t.from} -> ${t.to})`
-          ).join('\n');
-          waLines = `Total tracked transfer volume this snapshot: $${((c.totalUsd || 0) / 1e6).toFixed(1)}M${c.highVolume ? ' (above the disclosed high-volume floor)' : ''}.
-Pattern flags: ${flagsTxt}.
-Largest transfers:
-${topTxt || '  (none)'}`;
-        }
-
-        const nm = data.nineMagFlags || [];
-        const nineMagLines = nm.length ? nm.map(f =>
-          `  ${f.sym} (${f.name}) moved ${f.pct >= 0 ? '+' : ''}${fmt(f.pct, 1)}% today.${f.headline ? ` Headline found: "${f.headline}".` : ' No headline found for this move.'}`
-        ).join('\n') : null;
-
-        const dataBlock = `PRICE: $${fmt(data.price, 0)}
-
-SENTIMENT - composite: ${fmt(data.sentiment?.composite, 0)}/100
-Raw sources:
-${sourcesLines || '  (none)'}
-
-SOURCE-VS-BTC CORRELATION (composite: ${fmt(data.sourceCorrelations?.compositeCorrelation)})
-${corrLines || '  (none)'}
-
-TECHNICALS
-Tenkan: $${fmt(t.tenkan, 0)} - Kijun: $${fmt(t.kijun, 0)} - MA50: $${fmt(t.ma50, 0)} - MA100: $${fmt(t.ma100, 0)} - MA200: $${fmt(t.ma200, 0)}
-RSI(14): ${fmt(t.rsi14, 1)}
-Ichimoku Cloud: ${t.cloud?.position || 'N/A'} (Senkou A $${fmt(t.cloud?.senkouA, 0)} / B $${fmt(t.cloud?.senkouB, 0)})
-Volume: ${t.volume?.trend || 'N/A'}
-MA Crossover: ${t.maCrossover?.type ? `${t.maCrossover.type} cross, ${t.maCrossover.daysAgo} day(s) ago` : 'none in window'}
-Swing structure: ${t.swingStructure || 'N/A'}
-RSI/Price divergence: ${t.divergence?.type || 'none'}
-
-LIQUIDATION CLUSTERS (Hyperliquid-modeled, BTC-focused - only present if the Liquidation tab was visited this session with BTC focused; if absent, do not mention liquidation clusters at all)
-${liqLines}
-
-WHALE ACTIVITY (large exchange-flow transfers - only ever present when high current volatility has been detected client-side; if absent, do NOT mention whale activity, volatility being high or low, or speculate about either)
-${waLines || 'Not applicable right now - high volatility not currently detected, or whale data not fetched this session.'}
-
-PROBABILITY MODEL (frequency-based, NOT a guess)
-${pm.insufficient ? `Insufficient data (${pm.n || 0} matches) - do not state a probability, say so plainly.` : `${Math.round((pm.probUp || 0) * 100)}% of ${pm.n} historically comparable day(s) (bucket ${pm.bucket}-${(pm.bucket || 0) + 20}) saw BTC higher 7 days later.`}
-
-BUY THE NEWS VS PRICED IN
-Mechanism 1 (actual vs typical reaction): sentiment shift ${fmt(btn.reaction?.sentimentShift, 1)}, actual move ${fmt(btn.reaction?.actualPriceChange)}%, typical move for similar shifts ${fmt(btn.reaction?.typicalChange)}%. Read: ${btn.reaction?.read || 'insufficient data'}
-Mechanism 2 (multi-lag correlation pattern): ${(btn.lagPattern?.corrs || []).map(c => `${c.lag}h=${fmt(c.corr)}`).join(', ') || 'insufficient data'}. Read: ${btn.lagPattern?.read || 'insufficient data'}
-
-REGIME SCORECARD (from the Cycles tab — only present if that tab was visited this session; if absent, do not speculate about it)
-${data.regimeScorecard ? `Overall: ${data.regimeScorecard.bullCount}/${data.regimeScorecard.total} bullish, ${data.regimeScorecard.bearCount}/${data.regimeScorecard.total} bearish - ${data.regimeScorecard.overallLabel}
-Short-term (days): ${(data.regimeScorecard.shortTerm || []).map(f => `${f.label}=${f.display} (${f.tag})`).join(', ')}
-Medium-term (weeks): ${(data.regimeScorecard.midTerm || []).map(f => `${f.label}=${f.display} (${f.tag})`).join(', ')}
-Long-term (months+): ${(data.regimeScorecard.longTerm || []).map(f => `${f.label}=${f.display} (${f.tag})`).join(', ')}
-EVENT CALENDAR (CONFIDENCE MODIFIER ONLY — this does not vote bullish or bearish, it only affects how much weight to put on the short-term reads above): ${data.regimeScorecard.eventCalendar?.daysUntilFOMC != null ? `FOMC decision in ${data.regimeScorecard.eventCalendar.daysUntilFOMC} day(s).${data.regimeScorecard.eventCalendar.confidenceReduced ? ' This is close enough that short-term reads may just be pre-FOMC positioning, not organic trend — say so explicitly, do not treat this as bullish or bearish.' : ''}` : 'No FOMC date data available.'}` : 'Not available this session.'}
-
-ON-CHAIN VS PRICE (CoinMetrics active addresses, 30d trend, vs BTC price trend over the same window)
-${data.onChainDivergence ? `${data.onChainDivergence.label} (on-chain slope ${fmt(data.onChainDivergence.onchainSlope, 4)}, price slope ${fmt(data.onChainDivergence.priceSlope, 4)})` : 'Not available this session.'}
-
-SECTOR ROTATION (BTC's own 30d trend vs Nasdaq's 30d trend, normalized so scale doesn't matter — distinguishes "crypto-specific weakness" from "broad risk-off that's hitting everything")
-${data.sectorRotation ? `${data.sectorRotation.label} (BTC trend ${fmt(data.sectorRotation.btcSlope * 100, 3)}%/day, Nasdaq trend ${fmt(data.sectorRotation.nasdaqSlope * 100, 3)}%/day)` : 'Not available this session.'}
-
-TECHNICAL TIMEFRAME ALIGNMENT (50-WEEK EMA — a roughly one-year structural level, distinct from the 50/100/200-DAY technicals above which answer a near-term question)
-${data.technicalAlignment ? `${data.technicalAlignment.label} (price $${fmt(data.technicalAlignment.price, 0)} vs 50wk EMA $${fmt(data.technicalAlignment.ema50, 0)})` : 'Not available this session.'}
-
-TOP HEADLINES (individual news items behind the sentiment sources above, ranked by how strongly each one scored — NOT the same as the aggregate source numbers; these are the specific real headlines driving them)
-${(data.topHeadlines || []).length ? data.topHeadlines.map(h => `  [${h.category}, score ${fmt(h.score, 0)}] "${h.title}"`).join('\n') : '  (none available this cycle)'}
-
-9 MAGNIFICENT COMPANY MOVES (individual stock moves large enough to trigger a targeted news check — only present when at least one of the 9 tracked companies moved beyond +/-3.5% today; absent means none crossed that threshold this cycle)
-${nineMagLines || 'Not applicable — no individual company move crossed the threshold today.'}`;
-
+        const dataBlock = buildTraderAnalysisDataBlock(data);
         const prompt = `You are an experienced crypto trader writing a short, clear BTC market read for someone who wants to understand it in one pass, not decode jargon. You must use the exact numbers given - every value below was already calculated; do not compute, estimate, or invent any number not explicitly provided.
 
 CRITICAL RULES:
-- RSI(14) interpretation: only call it "overbought" if it is ABOVE 70, and only "oversold" if BELOW 30. A value between 50-70 is healthy bullish momentum, NOT overbought — do not mislabel it. Between 30-50 is bearish momentum, NOT oversold.
-- US Dollar / USD strength direction: a WEAKENING dollar (or falling rate-hike expectations, or rising rate-cut expectations) is the standard BULLISH signal for BTC and risk assets generally — never state or imply the reverse. A STRENGTHENING dollar (or rising rate-hike expectations) is the bearish/headwind direction. Do not confuse "hike expectations falling" with something bearish — falling hike expectations is itself the bullish case, not a reason for concern.
-- If a field says "insufficient data", "N/A", or "Not available": state that plainly ONCE, then move on. Do NOT follow it with a fabricated claim about that same topic (e.g. never say "not available, but it's probably above X" — if it's not available, you have nothing to say about X, full stop).
-- Never use the internal labels "Mechanism 1" or "Mechanism 2" in your output — translate them into plain questions instead: mechanism 1 (actual vs. typical reaction) becomes something like "has this already been priced in?"; mechanism 2 (multi-lag correlation) becomes something like "is the effect still unfolding?".
-- If a conflict exists between timeframes (short/medium/long-term, or between the regime scorecard's columns), name it explicitly and explain briefly why it might be happening (e.g. crypto-native flows vs. broader macro correlation) rather than just listing both sides.
-- Before labeling any Timeframe breakdown outlook (short/medium/long-term), check it against the TECHNICALS section you already described in your own output: if price is trading above Tenkan, Kijun, and the 50-day MA (bullish technical structure) but you are labeling that timeframe bearish anyway, say explicitly what is outweighing the bullish technicals (e.g. sentiment sources pulling the other way, a regime scorecard factor, an overbought/exhaustion read) — never state a directional label that contradicts the technical structure you already described without naming the reason for the disagreement.
-- The event calendar (FOMC proximity) is a CONFIDENCE modifier only — it tempers how much weight to put on short-term reads, it is never itself bullish or bearish.
-- If sector rotation shows BTC underperforming Nasdaq, say plainly that this looks like capital rotating away from crypto specifically, not generic risk-off.
-- LIQUIDATION CLUSTERS, if present, belongs INSIDE the Technicals section (never its own heading) as 1-2 extra plain-language sentences: current price, the nearest cluster above and below with their distance in % and modeled probability of being reached within the stated horizon, and today's crowding read. State the historical hit-rate or "not enough data yet" for calibration, and the monthly persistence or "not enough logged history yet", exactly as given - never guess these when the data says they're unavailable. If LIQUIDATION CLUSTERS says "Not available this session", do not mention liquidation clusters at all.
-- WHALE ACTIVITY, if present, ALSO belongs INSIDE the Technicals section (never its own heading), as 1 extra plain-language sentence on what the large-transfer pattern suggests (e.g. exchange outflows read as accumulation/reduced sell-side supply, inflows as potential distribution, bidirectional flow at the same exchange as repositioning/uncertainty) - state only what the transfer directions and flags actually show, never invent a motive. WHALE ACTIVITY only ever appears when high volatility has genuinely been detected - if it says "Not applicable right now", do not mention whale activity, large transfers, or volatility being high or low anywhere in your output.
-- Key takeaway must explicitly factor in LIQUIDATION CLUSTERS and WHALE ACTIVITY, when present, if either points to a plausible near-term price impact (e.g. a very close and reasonably probable cluster, or whale flow reinforcing or contradicting the rest of the read) - don't force them in if neither adds anything beyond what's already said elsewhere.
-- For the Geopolitical & Macro Drivers section: use ONLY the headlines listed in TOP HEADLINES, verbatim topic (you may paraphrase the headline briefly, do not invent an event not present in that list). Pick the 3 to 5 with the largest |score|. For each, give the headline's topic in a few words and one sentence on why it plausibly matters for BTC (e.g. risk-off/risk-on transmission, inflation/rate-cut expectations, dollar strength, haven demand) — do not assert a causal price move you weren't given data for. If TOP HEADLINES is empty or says "(none available this cycle)", say plainly that no headline-level detail was available this cycle and do not invent any events.
-- 9 MAGNIFICENT COMPANY MOVES gets its own short paragraph, always present in your output (even when nothing was flagged — see below). For each flagged company: state its % move and, if a headline was found, name the likely topic in plain words. Only explain a connection to crypto sentiment as far as the OTHER data in this prompt actually supports it (e.g. the 9 Magnificent composite score in SENTIMENT sources moved the same direction around the same time, or SECTOR ROTATION shows a related pattern) — if nothing else in the data connects it, say plainly that the move is noted but no clear crypto-market linkage is visible in what you were given. Never invent a causal story. If the section says "Not applicable," write one sentence saying no individual company move crossed the threshold today — do not skip this paragraph entirely.
+${TRADER_ANALYSIS_RULES}
 
-OUTPUT FORMAT — plain text, no markdown symbols (no #, **, |, >, since this displays as raw text, not rendered markdown), structured with blank lines between sections exactly like this:
-
-[One or two sentence summary: current price, overall lean, and the single biggest reason why.]
-
-Sentiment & drivers: [2-3 sentences on composite score, which raw sources are pulling it up or down, and what that implies.]
-
-Technicals: [2-3 sentences on RSI/MAs/Ichimoku/divergence/structure, using the correct RSI interpretation above. If LIQUIDATION CLUSTERS data is present, add 1-2 more sentences folding in the nearby modeled clusters, their distance/probability, and today's crowding read - in plain everyday language, not jargon. If WHALE ACTIVITY is present, add 1 more sentence on what the large-transfer pattern suggests.]
-
-Geopolitical & Macro Drivers: [3 to 5 bullet-style lines (use a leading dash, not a markdown bullet), each naming one headline topic from TOP HEADLINES and one sentence on its plausible market impact. If none available, say so plainly in one sentence instead of a list.]
-
-9 Magnificent Watch: [1-3 sentences on any flagged company moves and their headline, explaining the likely connection to crypto sentiment based on the data given, or noting there's no clear data-supported link. If no companies were flagged this cycle, write one sentence saying no individual company move crossed the threshold today.]
-
-Timeframe breakdown:
-Short-term (7d): [outlook] - [one-line reason, mention the FOMC confidence caveat here if relevant]
-Medium-term (30-50d): [outlook] - [one-line reason]
-Long-term: [outlook, or "not enough data yet" if genuinely unavailable] - [one-line reason if available]
-
-Key takeaway: [one sentence synthesizing everything above into the single most useful thing to know right now, explicitly weighing liquidation clusters and/or whale activity when present and relevant.]
+${TRADER_ANALYSIS_OUTPUT_FORMAT}
 
 DATA:
 ${dataBlock}`;
@@ -1470,6 +1485,7 @@ ${dataBlock}`;
       }
     }
 
+
     // ---- POST /gemini-outlook — powers the "Narrative" tab (previously
     // called "Outlook"; the old deterministic-only Narrative tab, with its
     // own /narrative-analysis route, was removed). Calls Gemini directly
@@ -1484,43 +1500,50 @@ ${dataBlock}`;
     // piece of ground-truth data passed in; the narrative content itself
     // is Gemini's own synthesis, not something CryptoPulse computed and is
     // just asking to be narrated. ----
-    // ---- POST /trader-analysis-crosscheck — a second, independent look at
-    // the first pass's narrative (from /trader-analysis, the fast Llama
-    // model working only off CryptoPulse's own snapshot data). Deliberately
-    // NOT Google Search grounding: /gemini-outlook already documented that
-    // grounding's free-tier billing requirement is genuinely ambiguous, and
-    // base Gemini calls are the unambiguously-free, already-proven path in
-    // this codebase — same mechanism, same model, same auth as
-    // /gemini-outlook. This is a broader-knowledge sanity check (does this
-    // read seem consistent with the wider context Gemini already knows,
-    // does anything look potentially stale), not literal live web search -
-    // an honest, safer substitute for "check against the internet" that
-    // doesn't carry the billing ambiguity. On-demand only (a button the
-    // user presses), not run automatically on every load, since this
-    // shares the same 20/day free-tier quota bucket as Foufi and Outlook,
-    // which has already been hit multiple times this project. ----
-    if (url.pathname === '/trader-analysis-crosscheck' && request.method === 'POST') {
+    // ---- POST /trader-analysis-gemini — Gemini's OWN full, independent
+    // analysis from the SAME data block /trader-analysis (fast Llama) uses,
+    // not a review of Llama's prose. Replaces the earlier, narrower
+    // "cross-check the narrative text" version: a short critique of prose
+    // Gemini didn't generate can only catch obvious logic errors (and it
+    // did — see the USD-direction and technicals-vs-label fixes this
+    // caught, now folded into TRADER_ANALYSIS_RULES for both models). Two
+    // full independent reads of the SAME raw numbers, using the SAME
+    // rules/format for genuine side-by-side comparability, is a more
+    // informative check than one model grading the other's writing.
+    //
+    // Deliberately NOT Google Search grounding: /gemini-outlook already
+    // documented that grounding's free-tier billing requirement is
+    // genuinely ambiguous, and base Gemini calls are the unambiguously-
+    // free, already-proven path in this codebase — same mechanism, same
+    // model, same auth as /gemini-outlook. Gemini IS explicitly invited to
+    // supplement with its own broader knowledge (unlike Llama, which is
+    // strictly constrained to the given numbers) — same differentiator
+    // /gemini-outlook already relies on — but must clearly flag whenever
+    // it does, so that's never mistaken for something CryptoPulse itself
+    // computed.
+    //
+    // On-demand only (a button the user presses), not run automatically on
+    // every load — this is a larger prompt+completion than the old
+    // crosscheck, and shares the same 20/day free-tier quota bucket as
+    // Foufi and Outlook, already hit multiple times this project. ----
+    if (url.pathname === '/trader-analysis-gemini' && request.method === 'POST') {
       if (!env.GEMINI_API_KEY) {
         return new Response(JSON.stringify({ error: 'GEMINI_API_KEY not configured on this Worker' }), { status: 500, headers: corsHeaders });
       }
       try {
         const data = await request.json();
-        const narrative = (data.narrative || '').trim();
-        if (!narrative) throw new Error('No narrative provided to cross-check');
-        const price = data.price != null ? `$${Math.round(data.price).toLocaleString()}` : 'an unspecified price';
+        const dataBlock = buildTraderAnalysisDataBlock(data);
+        const prompt = `You are an experienced crypto trader writing your OWN independent BTC market read from the live snapshot data below — the exact same data another, faster model was also given to write its own separate read. Do not assume you're reviewing or agreeing with that other read; you haven't seen it. Write your own analysis from the numbers.
 
-        const prompt = `You are reviewing a BTC market read that was just generated by a smaller, fast model from live snapshot data (price, technicals, sentiment sources, on-chain metrics) — NOT from any live news or web search. Your job is a sanity check, not a rewrite: does anything in this read seem inconsistent with the broader crypto market context you're aware of, or does anything sound like it could be stale or miss a significant recent development?
+You must use the exact numbers given for anything below - do not invent or alter a number that was provided. Unlike a purely numeric model, you MAY supplement with your own broader knowledge of current crypto market conditions and context beyond this snapshot (e.g. a recent macro development, a narrative you're aware of) — but whenever you do this, say explicitly that it's from your own broader knowledge, not from the snapshot data, so it's never mistaken for something CryptoPulse itself computed. If you're not confident something in your broader knowledge is current, say so plainly rather than stating it as settled fact.
 
-RULES:
-- You do NOT have live internet access or search — do not claim to, and do not invent a specific recent headline or event you cannot actually verify from your own training. If you suspect something might be stale, say that plainly ("this may not reflect very recent developments") rather than inventing what that development might be.
-- If the read looks broadly consistent with what you know and nothing stands out, say so plainly in one sentence — "No concerns — this read looks broadly consistent" is a completely valid and expected answer. Do not manufacture a concern just to have something to say.
-- Be specific when you do flag something: name the specific claim in the read you're questioning and why, not a vague general caveat.
-- 2-4 sentences maximum. Plain text, no markdown symbols.
+CRITICAL RULES:
+${TRADER_ANALYSIS_RULES}
 
-BTC PRICE AT TIME OF READ: ${price}
+${TRADER_ANALYSIS_OUTPUT_FORMAT}
 
-THE READ TO REVIEW:
-${narrative}`;
+DATA:
+${dataBlock}`;
 
         const geminiRes = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
@@ -1537,7 +1560,7 @@ ${narrative}`;
         const geminiJson = await geminiRes.json();
         const text = geminiJson?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (!text) throw new Error('Empty or unexpected Gemini response shape: ' + JSON.stringify(geminiJson).slice(0, 300));
-        return new Response(JSON.stringify({ crosscheck: text.trim(), ts: Date.now() }), {
+        return new Response(JSON.stringify({ analysis: text.trim(), ts: Date.now() }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         });
       } catch (err) {
