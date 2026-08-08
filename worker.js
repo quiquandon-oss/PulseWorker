@@ -1127,14 +1127,18 @@ RULES:
     // by this) — purely additive, cannot affect the existing daily views
     // even if this table were empty or wrong. Stores both USD and EUR at
     // log time (not just one, converted later) so the 24H chart can switch
-    // currency without needing a live FX rate applied to historical points. ----
+    // currency without needing a live FX rate applied to historical points.
+    // Also stores per-asset prices (prices_json) — needed for feature
+    // parity with the other ranges, where selecting a specific coin shows
+    // ITS price, not total portfolio value. Without this the 24H view could
+    // only ever show the total, regardless of which coin chip was active. ----
     if (url.pathname === '/portfolio-log' && request.method === 'POST') {
       try {
-        const { value_usd, value_eur, fx } = await request.json();
+        const { value_usd, value_eur, fx, prices } = await request.json();
         if (value_usd == null) throw new Error('value_usd required');
         await env.DB.prepare(
-          'INSERT INTO portfolio_snapshots (ts, value_usd, value_eur, fx) VALUES (?,?,?,?)'
-        ).bind(Date.now(), value_usd, value_eur ?? null, fx ?? null).run();
+          'INSERT INTO portfolio_snapshots (ts, value_usd, value_eur, fx, prices_json) VALUES (?,?,?,?,?)'
+        ).bind(Date.now(), value_usd, value_eur ?? null, fx ?? null, prices ? JSON.stringify(prices) : null).run();
         return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
@@ -1147,7 +1151,7 @@ RULES:
         const hours = Math.min(168, parseInt(url.searchParams.get('hours') || '24', 10));
         const since = Date.now() - hours * 3600000;
         const { results } = await env.DB.prepare(
-          'SELECT ts, value_usd, value_eur FROM portfolio_snapshots WHERE ts >= ? ORDER BY ts ASC'
+          'SELECT ts, value_usd, value_eur, prices_json FROM portfolio_snapshots WHERE ts >= ? ORDER BY ts ASC'
         ).bind(since).all();
         return new Response(JSON.stringify({ points: results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
