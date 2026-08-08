@@ -444,8 +444,12 @@ These two fields are about what will move price in the NEXT FEW HOURS, not mediu
 - none = no single identifiable short-term catalyst, or the video's tone was driven by pure technical levels
 Do NOT use "macro" for adoption, partnership, infrastructure, or regulatory-approval news (e.g. a company acquiring a stablecoin business, an ETF approval) — these are real but they are multi-week stories, not next-few-hours price drivers. Leave both fields "none" rather than force-fitting a story that isn't actually a short-term catalyst.
 
+Major pending catalyst: [only if Foufi specifically names a significant STILL-PENDING legislative, regulatory, or similarly structural event that the market is waiting on — e.g. a named bill working through a legislature, a major pending regulatory decision — give its name and his stated status/lean in one line, e.g. "CLARITY Act: Senate vote delayed, bearish near-term". If he doesn't mention anything like this, or only discusses something that already happened (an approval, a decision already made) rather than something still pending, write "none".]
+
+This is deliberately NOT the same as macro/micro/tradfi above — a still-pending structural catalyst (something the whole market is waiting on, that hasn't resolved yet) is a different kind of thing than a same-day price driver, and deserves its own line so it isn't lost inside general macro commentary. Only ever name ONE such catalyst — the single most significant one he discusses, if any.
+
 On its own final line, nothing else on it:
-FOUFI_JSON: {"market_summary":"...","macro":{"lean":"bullish|bearish|neutral","text":"..."},"micro":{"lean":"bullish|bearish|neutral","text":"..."},"tradfi":{"lean":"bullish|bearish|neutral","text":"..."},"coins":{"BTC":{"score":-2,"note":"..."},"ETH":{"score":null,"note":"not addressed in this video"},"SOL":{"score":null,"note":"..."},"LINK":{"score":null,"note":"..."},"HYPE":{"score":null,"note":"..."}},"dominant_driver":"macro|tradfi|micro|none","secondary_driver":"macro|tradfi|micro|none"}`;
+FOUFI_JSON: {"market_summary":"...","macro":{"lean":"bullish|bearish|neutral","text":"..."},"micro":{"lean":"bullish|bearish|neutral","text":"..."},"tradfi":{"lean":"bullish|bearish|neutral","text":"..."},"coins":{"BTC":{"score":-2,"note":"..."},"ETH":{"score":null,"note":"not addressed in this video"},"SOL":{"score":null,"note":"..."},"LINK":{"score":null,"note":"..."},"HYPE":{"score":null,"note":"..."}},"dominant_driver":"macro|tradfi|micro|none","secondary_driver":"macro|tradfi|micro|none","major_catalyst":{"name":"...or null","status":"...or null"}}`;
 
       const geminiRes = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`,
