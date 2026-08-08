@@ -712,6 +712,51 @@ export default {
       }
     }
 
+    // ---- GET /strc-proxy — Strategy's (MSTR) "Stretch" perpetual preferred
+    // (STRC), fetched the same way as 9 Magnificent (Yahoo Finance v8/chart,
+    // same unofficial-endpoint caveats apply). Deliberately a SEPARATE route
+    // rather than folding into NINE_MAG_SYMBOLS above: that route's
+    // semantics (market-cap weighting, SpaceX-style IPO dampening, a 3.5%
+    // move threshold tuned for common-stock volatility) don't fit STRC,
+    // which is a par-anchored ($100) low-volatility-by-design instrument —
+    // even its real stress episodes played out as a gradual drift over
+    // weeks, not single-day spikes. Confirmed via research (Strategy's own
+    // June 29 2026 policy announcement, SEC 8-Ks, CoinDesk coverage) before
+    // building: Strategy's stated target is STRC trading in a $99-$100
+    // range; real deviations below that have historically correlated with
+    // thin dividend-reserve coverage and, in the worst case, forced BTC
+    // sales specifically to fund dividends — this is a health/stress proxy
+    // for the whole capital-raising machine, not a simple "higher=bullish"
+    // signal. See strcHealthScore on the frontend for the scoring logic
+    // this feeds. ----
+    if (url.pathname === '/strc-proxy' && request.method === 'GET') {
+      try {
+        const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/STRC?interval=1d&range=3mo`;
+        const res = await fetch(yUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+        });
+        if (!res.ok) throw new Error('STRC ' + res.status);
+        const json = await res.json();
+        const result = json?.chart?.result?.[0];
+        const meta = result?.meta;
+        if (!meta || meta.regularMarketPrice == null) throw new Error('STRC no price data');
+        const timestamps = result.timestamp || [];
+        const closes = result.indicators?.quote?.[0]?.close || [];
+        const series = timestamps.map((t, i) => ({ ts: t * 1000, close: closes[i] })).filter((p) => p.close != null);
+        // Same fix already proven necessary for 9 Magnificent: derive
+        // prevClose from the daily series itself, not meta.previousClose/
+        // chartPreviousClose, which reflects the close before the requested
+        // 3mo RANGE began rather than yesterday's actual close.
+        const prevClose = series.length >= 2 ? series[series.length - 2].close : (meta.previousClose ?? meta.chartPreviousClose);
+        const pct = prevClose ? ((meta.regularMarketPrice - prevClose) / prevClose) * 100 : null;
+        return new Response(JSON.stringify({
+          price: meta.regularMarketPrice, prevClose, pct, series, ts: Date.now(),
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: corsHeaders });
+      }
+    }
+
     // ---- GET /stock-proxy — "9 Magnificent" (Broadcom, Apple, Tesla,
     // Microsoft, Meta, Alphabet, Amazon, Nvidia, SpaceX), fetched server-side
     // via Yahoo Finance's v8/finance/chart endpoint. This is an unofficial,
