@@ -1055,7 +1055,68 @@ RULES:
       }
     }
 
-    // ---- POST /liquidation-analysis — LLM narration of CryptoPulse's
+    // ---- POST /whale-log — persists what the client already fetched and
+    // classified (CryptoPulse's own /whale-proxy call, its own exchange-vs-
+    // unknown-wallet classification, its own concentration/bidirectional/
+    // high-volume flag detection) into D1. This route computes NOTHING new
+    // and never re-derives direction or flags — it only writes down numbers
+    // the client already has, the same "log what's already being fetched"
+    // principle already used for other tiles. Built specifically because
+    // whale activity had NO persistence at all — confirmed via a direct D1
+    // table listing that no such table existed, meaning it could never be
+    // checked against real-world figures the way ETF flows just were.
+    // Fires once per client-side whale-tile render (whenever the Sentiment
+    // tab is visited with real data available) — not cron-driven, so
+    // history density depends on how often the app is actually used, not a
+    // uniform snapshot cadence. No deduplication guard: near-duplicate
+    // entries from repeated visits in one sitting are accepted as a
+    // reasonable tradeoff for staying simple; revisit only if the table
+    // grows enough to matter. ----
+    if (url.pathname === '/whale-log' && request.method === 'POST') {
+      try {
+        const { transfers, concentration } = await request.json();
+        const list = Array.isArray(transfers) ? transfers : [];
+        let inflowCount = 0, outflowCount = 0, inflowUsd = 0, outflowUsd = 0;
+        list.forEach((t) => {
+          if (t.direction === 'inflow') { inflowCount++; inflowUsd += t.usd || 0; }
+          else if (t.direction === 'outflow') { outflowCount++; outflowUsd += t.usd || 0; }
+        });
+        await env.DB.prepare(
+          'INSERT INTO whale_snapshots (ts, total_usd, elevated, inflow_count, outflow_count, inflow_usd, outflow_usd, transfers_json) VALUES (?,?,?,?,?,?,?,?)'
+        ).bind(
+          Date.now(), concentration?.totalUsd || 0, concentration?.elevated ? 1 : 0,
+          inflowCount, outflowCount, inflowUsd, outflowUsd, JSON.stringify(list)
+        ).run();
+        return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // ---- GET /whale-history?days=N — aggregated daily totals, for
+    // checking logged whale activity against real-world reporting (e.g. a
+    // news figure like "$1.2B this week") without pulling every raw
+    // snapshot client-side. ----
+    if (url.pathname === '/whale-history' && request.method === 'GET') {
+      try {
+        const days = Math.min(90, parseInt(url.searchParams.get('days') || '7', 10));
+        const since = Date.now() - days * 86400000;
+        const { results } = await env.DB.prepare(
+          `SELECT
+             strftime('%Y-%m-%d', ts / 1000, 'unixepoch') as day,
+             COUNT(*) as snapshots,
+             SUM(inflow_usd) as inflow_usd,
+             SUM(outflow_usd) as outflow_usd,
+             SUM(inflow_count) as inflow_count,
+             SUM(outflow_count) as outflow_count,
+             SUM(CASE WHEN elevated=1 THEN 1 ELSE 0 END) as elevated_snapshots
+           FROM whale_snapshots WHERE ts >= ? GROUP BY day ORDER BY day ASC`
+        ).bind(since).all();
+        return new Response(JSON.stringify({ days: results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
     // modeled liquidation levels (leverage-tier calculation on real
     // Hyperliquid mark price + funding), the crowding/elevated flags, and the
     // monthly persistence check — all already computed by CryptoPulse, the
