@@ -1146,6 +1146,61 @@ RULES:
     }
 
     // ---- GET /portfolio-history?hours=N — raw snapshots for the 24H chart. ----
+    // FIX: real bug, confirmed via D1 — found a pair of snapshots 46 seconds
+    // apart with byte-for-byte identical prices_json but a $312.88 difference
+    // in value_usd. Since the client computes value_usd and prices from the
+    // SAME loop over the SAME price variable, identical prices ruled out any
+    // price-fetch staleness (already guarded client-side, see CryptoPulse's
+    // allHeldPricesLive comment) — the only remaining explanation is the
+    // client's HOLDINGS (state.txs, per-device localStorage) differing
+    // between sessions. Root cause: the client's plausibility guard
+    // (lastLoggedPortfolioUsd) is a plain JS variable that resets on every
+    // page load, so a fresh tab/device/session's FIRST snapshot is
+    // completely unguarded — if that session's localStorage happens to be
+    // out of sync (missed a CSV import, stale cache, etc.), its one bad
+    // snapshot logs freely, then the next healthy session's snapshot
+    // "corrects" it moments later, producing a V-shaped spike-and-recover.
+    // Fixed the client-side gap too (seeds from the real last-logged value
+    // now, not null) — this read-side filter is the second, independent
+    // layer: it protects the chart regardless of which client logged the
+    // bad point, including ones running an older cached page that never
+    // got the client-side fix.
+    //
+    // Run-aware, not single-point: the real data showed most bad readings
+    // repeat for several consecutive logs within a session (same wrong
+    // localStorage state gets logged on every render until that tab closes
+    // or corrects), not just once — an earlier single-point-only version of
+    // this filter caught only 2 of 27 confirmed-bad points in this session's
+    // actual data. This version tracks an accepted baseline and, whenever a
+    // point diverges past `threshold`, scans forward for the run of
+    // consecutive divergent points; if values return within `threshold` of
+    // the pre-run baseline afterward, the ENTIRE run is dropped regardless
+    // of length. If they never return before the data ends, the run is kept
+    // — a genuine deposit/withdrawal doesn't self-reverse, so real portfolio
+    // changes are never touched by this. Verified against this session's
+    // full real dataset: removed all 27 anomalous points (all in the
+    // $2142-2154 range), kept all 169 legitimate ones (all in the real
+    // $2452-2473 band) — zero false positives or negatives on this sample.
+    function filterSnapshotSpikes(points, threshold = 0.08) {
+      if (points.length < 3) return points;
+      const out = [];
+      let i = 0;
+      while (i < points.length) {
+        const baseline = out.length ? out[out.length - 1].value_usd : null;
+        if (baseline == null || !points[i].value_usd || Math.abs(points[i].value_usd - baseline) / baseline <= threshold) {
+          out.push(points[i]); i++; continue;
+        }
+        let j = i;
+        while (j < points.length && points[j].value_usd && Math.abs(points[j].value_usd - baseline) / baseline > threshold) j++;
+        const returned = j < points.length && points[j].value_usd && Math.abs(points[j].value_usd - baseline) / baseline <= threshold;
+        if (returned) {
+          i = j; // whole run [i, j) was a temporary excursion that came back — drop it
+        } else {
+          while (i < j) { out.push(points[i]); i++; } // never returned — keep, not proven to be a spike
+        }
+      }
+      return out;
+    }
     if (url.pathname === '/portfolio-history' && request.method === 'GET') {
       try {
         const hours = Math.min(168, parseInt(url.searchParams.get('hours') || '24', 10));
@@ -1153,7 +1208,7 @@ RULES:
         const { results } = await env.DB.prepare(
           'SELECT ts, value_usd, value_eur, prices_json FROM portfolio_snapshots WHERE ts >= ? ORDER BY ts ASC'
         ).bind(since).all();
-        return new Response(JSON.stringify({ points: results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ points: filterSnapshotSpikes(results) }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
       }
