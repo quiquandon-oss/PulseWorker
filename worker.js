@@ -583,6 +583,39 @@ async function fetchCoinGecko7dAvgAndWindow(sym) {
   return { avg7d, best };
 }
 
+// FIX: real bug, confirmed via D1/client inspection -- CryptoPulse's
+// embedded PRICE_HISTORY seed data stops at a fixed date (baked in at
+// build time), and beyond that every day's price only gets recorded if
+// that specific browser happened to open the app that specific day
+// (client writes today's price to localStorage on each visit). Any day
+// nobody opened the app -- or opened it on a different device -- has no
+// entry, and the client's nearest-previous-date fallback silently
+// reuses the last known price, frozen, for every missing day. Produces
+// exactly what was reported: a flat plateau on the Total Portfolio Value
+// chart during real price recovery, because the chart was drawing a
+// stale frozen price instead of what the market actually did.
+// This endpoint is the real fix: one canonical daily price history,
+// server-side, available to any device/session on load -- not dependent
+// on which days a particular browser happened to be open.
+async function fetchPriceHistoryBackfill(sym) {
+  const id = CG_IDS[sym]; if (!id) return null;
+  const res = await fetch(`${CG}/coins/${id}/market_chart?vs_currency=usd&days=90&interval=daily`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+  });
+  if (!res.ok) throw new Error('CoinGecko market_chart ' + res.status);
+  const json = await res.json();
+  const prices = json.prices || [];
+  // One entry per UTC calendar day -- last price seen for that day wins,
+  // matching a daily-close convention (consistent with what the embedded
+  // PRICE_HISTORY seed data already looks like: one value per date key).
+  const byDay = {};
+  for (const [ts, price] of prices) {
+    const day = new Date(ts).toISOString().slice(0, 10);
+    byDay[day] = price; // later entries for the same day overwrite -> last wins
+  }
+  return byDay;
+}
+
 // ---------- Main alert evaluator — runs every 15 minutes ----------
 async function evaluateAlerts(env) {
   const now = Date.now();
@@ -1211,6 +1244,19 @@ RULES:
         return new Response(JSON.stringify({ points: filterSnapshotSpikes(results) }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+    // ---- GET /price-history-backfill?coin=BTC — canonical daily closes,
+    // last 90 days, server-side. See fetchPriceHistoryBackfill's comment
+    // for the full root-cause writeup this exists to fix. ----
+    if (url.pathname === '/price-history-backfill' && request.method === 'GET') {
+      try {
+        const coin = (url.searchParams.get('coin') || '').toUpperCase();
+        if (!CG_IDS[coin]) return new Response(JSON.stringify({ ok: false, error: 'unknown coin' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const prices = await fetchPriceHistoryBackfill(coin);
+        return new Response(JSON.stringify({ ok: true, coin, prices }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 500, headers: corsHeaders });
       }
     }
     // modeled liquidation levels (leverage-tier calculation on real
