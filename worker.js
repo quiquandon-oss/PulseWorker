@@ -1178,6 +1178,51 @@ RULES:
       }
     }
 
+    // ---- POST /txs-backup, GET /txs-backup — automatic server-side backup
+    // of the user's real transaction ledger. Exists specifically because
+    // this already happened: browser storage got evicted mid-session,
+    // CryptoPulse silently fell back to a stale build-time snapshot, and
+    // six weeks of real transactions vanished from every number in the app
+    // with zero warning. localStorage is fine as the primary store, but it
+    // had no backup at all -- this is that backup, not a replacement.
+    //
+    // KNOWN GAP, DELIBERATE: this route has no auth yet (the audit that
+    // flagged this exact endpoint class also flagged the fix -- a shared
+    // secret header -- which needs the user to set a Worker secret I can't
+    // set myself). Until that's added, this write route is exactly as
+    // exposed as the existing unauthenticated ones (/portfolio-log,
+    // /whale-log). The shape validation below is a partial mitigation
+    // (rejects obviously-malformed payloads), not a substitute for real
+    // auth -- a determined attacker could still write a plausible-looking
+    // fake backup. Flagging this loudly rather than quietly shipping a
+    // write endpoint that looks "done."
+    if (url.pathname === '/txs-backup' && request.method === 'POST') {
+      try {
+        const { txs } = await request.json();
+        if (!Array.isArray(txs)) throw new Error('txs[] required');
+        if (txs.length > 5000) throw new Error('txs[] too large (max 5000) -- refusing, this looks wrong');
+        const valid = txs.every(t => t && typeof t.asset === 'string' && typeof t.date === 'string'
+          && (t.type === 'buy' || t.type === 'sell') && typeof t.qty === 'number' && t.qty > 0);
+        if (!valid) throw new Error('one or more transactions missing required fields (asset, date, type, qty) -- refusing the whole batch rather than silently backing up something malformed');
+        const json = JSON.stringify(txs);
+        if (json.length > 2_000_000) throw new Error('payload too large -- refusing');
+        await env.DB.prepare('INSERT INTO txs_backup (ts, n_txs, txs_json) VALUES (?,?,?)').bind(Date.now(), txs.length, json).run();
+        await env.DB.prepare('DELETE FROM txs_backup WHERE id NOT IN (SELECT id FROM txs_backup ORDER BY ts DESC LIMIT 10)').run();
+        return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+    if (url.pathname === '/txs-backup' && request.method === 'GET') {
+      try {
+        const row = await env.DB.prepare('SELECT ts, n_txs, txs_json FROM txs_backup ORDER BY ts DESC LIMIT 1').first();
+        if (!row) return new Response(JSON.stringify({ ok: true, found: false }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ ok: true, found: true, ts: row.ts, n_txs: row.n_txs, txs: JSON.parse(row.txs_json) }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
     // ---- GET /portfolio-history?hours=N — raw snapshots for the 24H chart. ----
     // FIX: real bug, confirmed via D1 — found a pair of snapshots 46 seconds
     // apart with byte-for-byte identical prices_json but a $312.88 difference
