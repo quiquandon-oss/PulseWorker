@@ -1196,14 +1196,25 @@ RULES:
     // auth -- a determined attacker could still write a plausible-looking
     // fake backup. Flagging this loudly rather than quietly shipping a
     // write endpoint that looks "done."
+    // Extracted into its own named function specifically so it's testable
+    // in isolation (see PulseWorker/tests/txs-backup-validation.test.js) --
+    // this is the one thing standing between this unauthenticated route and
+    // a malformed/malicious payload actually landing in D1, worth pinning
+    // down with real test cases rather than trusting it by inspection alone.
+    function isValidTxsPayload(txs) {
+      if (!Array.isArray(txs)) return { valid: false, error: 'txs[] required' };
+      if (txs.length > 5000) return { valid: false, error: 'txs[] too large (max 5000) -- refusing, this looks wrong' };
+      const allValid = txs.every(t => t && typeof t.asset === 'string' && typeof t.date === 'string'
+        && (t.type === 'buy' || t.type === 'sell') && typeof t.qty === 'number' && t.qty > 0);
+      if (!allValid) return { valid: false, error: 'one or more transactions missing required fields (asset, date, type, qty) -- refusing the whole batch rather than silently backing up something malformed' };
+      return { valid: true };
+    }
+
     if (url.pathname === '/txs-backup' && request.method === 'POST') {
       try {
         const { txs } = await request.json();
-        if (!Array.isArray(txs)) throw new Error('txs[] required');
-        if (txs.length > 5000) throw new Error('txs[] too large (max 5000) -- refusing, this looks wrong');
-        const valid = txs.every(t => t && typeof t.asset === 'string' && typeof t.date === 'string'
-          && (t.type === 'buy' || t.type === 'sell') && typeof t.qty === 'number' && t.qty > 0);
-        if (!valid) throw new Error('one or more transactions missing required fields (asset, date, type, qty) -- refusing the whole batch rather than silently backing up something malformed');
+        const check = isValidTxsPayload(txs);
+        if (!check.valid) throw new Error(check.error);
         const json = JSON.stringify(txs);
         if (json.length > 2_000_000) throw new Error('payload too large -- refusing');
         await env.DB.prepare('INSERT INTO txs_backup (ts, n_txs, txs_json) VALUES (?,?,?)').bind(Date.now(), txs.length, json).run();

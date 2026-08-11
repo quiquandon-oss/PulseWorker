@@ -1,0 +1,26 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Separate workflow from the deploy one, not a step inside it — same
+# reasoning as CryptoPulse's test.yml: doesn't block deploy yet, that's a
+# deliberate follow-up decision, not a side effect of adding tests.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run tests
+        run: npm test
