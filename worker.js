@@ -754,9 +754,35 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, X-App-Secret',
     };
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
+
+    // ---- Auth gate for the routes worth protecting -- writes, AI-backed
+    // calls with real cost/quota, and reads of genuinely sensitive data
+    // (the full transaction backup). Deliberately does NOT cover every
+    // route: this Worker has no login system and the frontend is a fully
+    // public static site, so X-App-Secret can never be a real secret from
+    // a determined attacker who opens dev tools -- it stops automated
+    // scanners and casual poking, not someone who actually looks. Read-only
+    // routes serving already-computed aggregate/public data are left open
+    // so the frontend keeps working exactly as before with zero risk of
+    // this silently breaking normal usage.
+    const PROTECTED_ROUTES = new Set([
+      'POST:/whale-analysis', 'POST:/whale-log', 'POST:/portfolio-log',
+      'POST:/txs-backup', 'GET:/txs-backup', 'POST:/liquidation-analysis',
+      'POST:/history', 'POST:/backfill-sources', 'POST:/alert-configs',
+      'POST:/alert-configs/toggle', 'POST:/alert-configs/delete', 'POST:/test-telegram',
+      'GET:/run-technical-eval', 'POST:/run-technical-eval', 'POST:/trader-analysis',
+      'POST:/trader-analysis-gemini', 'POST:/gemini-outlook',
+      'GET:/foufi-backfill-rss', 'GET:/foufi-check',
+    ]);
+    if (PROTECTED_ROUTES.has(`${request.method}:${url.pathname}`)) {
+      const provided = request.headers.get('X-App-Secret');
+      if (!env.APP_SECRET || provided !== env.APP_SECRET) {
+        return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
 
     // ---- GET /news-proxy?source=crypto|macro|geopolitics|regulatory ----
     if (url.pathname === '/news-proxy' && request.method === 'GET') {
