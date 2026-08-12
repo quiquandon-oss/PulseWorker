@@ -616,6 +616,106 @@ async function fetchPriceHistoryBackfill(sym) {
   return byDay;
 }
 
+// ---------- Coin-specific catalyst detection — runs alongside the 15-min
+// alert cron ----------
+// Real gap found and fixed: V2's own regime-anomaly detection already
+// catches WHEN a coin is doing something statistically unusual compared to
+// its own recent history (confirmed working in real time against a real
+// event -- LINK's Standard Chartered $200-by-2030 target, Aug 2026 -- the
+// anomaly flag fired within hours of the price actually starting to move,
+// with zero news awareness at all) but nothing previously explained WHY.
+// Modeled on the existing 9 Magnificent pattern in this file: detect the
+// numeric fact first, THEN hand it to a small, honest LLM call with any
+// matched headline -- explicitly allowed to say "no clear cause found"
+// rather than forcing a connection, same standard as everywhere else in
+// this app. V2 only models BTC and LINK -- ETH/SOL/HYPE have no anomaly
+// signal to hook into at all, this mechanism can never cover them.
+const COIN_KEYWORDS = {
+  BTC: [/\bbitcoin\b/i, /\bBTC\b/],
+  LINK: [/\bchainlink\b/i, /\bLINK\b/],
+};
+async function checkCoinCatalysts(env) {
+  for (const coin of ['BTC', 'LINK']) {
+    try {
+      const table = coin === 'BTC' ? 'predictions' : 'link_predictions';
+      const priceTable = coin === 'BTC' ? 'btc_data' : 'link_data';
+      const priceField = coin === 'BTC' ? 'btc_price' : 'link_price';
+
+      // Flip detection on the 24h horizon specifically (12h and 24h can
+      // disagree on anomaly status at the same timestamp -- picking one
+      // horizon avoids an ambiguous "is it anomalous right now" read).
+      const { results: recent } = await env.DB.prepare(
+        `SELECT ts, is_regime_anomaly FROM ${table} WHERE horizon_hours = 24 ORDER BY ts DESC LIMIT 4`
+      ).all();
+      if (recent.length < 2) continue;
+      const nowAnomalous = recent[0].is_regime_anomaly === 1;
+      const wasAnomalousBefore = recent.slice(1).some(r => r.is_regime_anomaly === 1);
+      if (!nowAnomalous || wasAnomalousBefore) continue; // only a FRESH flip is worth a check, not sustained or absent
+
+      // Dedup -- skip if already checked this coin within the last 6h, so a
+      // flickering flag doesn't trigger repeated Llama calls for the same
+      // underlying event.
+      const last = await env.DB.prepare(
+        'SELECT ts FROM coin_catalyst_log WHERE coin = ? ORDER BY ts DESC LIMIT 1'
+      ).bind(coin).first();
+      if (last && Date.now() - last.ts < 6 * 3600000) continue;
+
+      // Price move over roughly the last 24h, from the authoritative price
+      // table (not derived from the prediction rows themselves).
+      const since = await env.DB.prepare(
+        `SELECT ${priceField} as price FROM ${priceTable} WHERE ts >= ? ORDER BY ts ASC LIMIT 1`
+      ).bind(Date.now() - 25 * 3600000).first();
+      const latest = await env.DB.prepare(
+        `SELECT ${priceField} as price FROM ${priceTable} ORDER BY ts DESC LIMIT 1`
+      ).first();
+      const priceMovePct = (since && latest && since.price) ? ((latest.price - since.price) / since.price) * 100 : null;
+
+      // Targeted search -- crypto + regulatory feeds, the two most likely to
+      // carry a coin-specific analyst report, listing, or partnership story.
+      const feeds = [
+        { url: 'https://cointelegraph.com/rss', name: 'CoinTelegraph' },
+        { url: 'https://www.coindesk.com/arc/outboundfeeds/rss/', name: 'CoinDesk' },
+        { url: 'https://www.theblock.co/rss.xml', name: 'The Block' },
+      ];
+      const feedResults = await Promise.allSettled(feeds.map(async f => {
+        const res = await fetch(f.url);
+        if (!res.ok) throw new Error(f.name + ' ' + res.status);
+        return parseRssTitles(await res.text(), f.name);
+      }));
+      const allItems = feedResults.flatMap(r => r.status === 'fulfilled' ? r.value : []);
+      const keywords = COIN_KEYWORDS[coin];
+      const matched = allItems.find(item => keywords.some(kw => kw.test(item.title) || kw.test(item.description)));
+
+      let extractedReason = null;
+      if (matched) {
+        const prompt = `${coin} just started behaving statistically unusually compared to its own recent history (CryptoPulse's own anomaly detector flagged it -- this is not a prediction, just "this looks different from anything recently seen"). Price has moved ${priceMovePct != null ? priceMovePct.toFixed(1) + '%' : 'an unknown amount'} over roughly the last 24 hours.
+
+A headline mentioning ${coin} was found in today's news feeds:
+"${matched.title}" (${matched.source})
+${matched.description ? 'Summary: ' + matched.description : ''}
+
+In 1-2 plain sentences, say whether this headline plausibly explains the move. If it clearly could (a price target, partnership, listing, exploit, regulatory action), say so and name the topic in plain words. If it's unrelated or you're not confident it's the actual cause, say plainly that no clear cause was identified in this cycle's headlines -- do not force a connection that isn't well supported.`;
+        try {
+          const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 200,
+          });
+          extractedReason = typeof result.response === 'string' ? result.response.trim() : null;
+        } catch (e) {
+          extractedReason = null; // best-effort -- a failed explanation shouldn't block logging the raw fact
+        }
+      }
+
+      await env.DB.prepare(
+        'INSERT INTO coin_catalyst_log (ts, coin, price_move_pct, headline_matched, headline_source, extracted_reason) VALUES (?,?,?,?,?,?)'
+      ).bind(Date.now(), coin, priceMovePct, matched ? matched.title : null, matched ? matched.source : null, extractedReason).run();
+    } catch (err) {
+      // Best-effort per coin -- one coin's check failing (a feed down, a
+      // malformed row) should never block the other coin's check.
+    }
+  }
+}
+
 // ---------- Main alert evaluator — runs every 15 minutes ----------
 async function evaluateAlerts(env) {
   const now = Date.now();
@@ -742,6 +842,7 @@ export default {
     // over guessing a single fixed time and often being late or early.
     if (event.cron === '*/15 * * * *') {
       ctx.waitUntil(evaluateAlerts(env));
+      ctx.waitUntil(checkCoinCatalysts(env));
     } else if (event.cron === '0 * * * *') {
       ctx.waitUntil(checkFoufiDigest(env));
     } else {
@@ -1130,6 +1231,27 @@ RULES:
     // checking logged whale activity against real-world reporting (e.g. a
     // news figure like "$1.2B this week") without pulling every raw
     // snapshot client-side. ----
+    // ---- GET /coin-catalyst-log?coin=BTC|LINK&limit=N — recent catalyst
+    // checks. See checkCoinCatalysts's comment for the full design.
+    if (url.pathname === '/coin-catalyst-log' && request.method === 'GET') {
+      try {
+        const coin = (url.searchParams.get('coin') || '').toUpperCase();
+        const limit = Math.min(50, parseInt(url.searchParams.get('limit') || '10', 10));
+        let query, binding;
+        if (coin === 'BTC' || coin === 'LINK') {
+          query = 'SELECT * FROM coin_catalyst_log WHERE coin = ? ORDER BY ts DESC LIMIT ?';
+          binding = [coin, limit];
+        } else {
+          query = 'SELECT * FROM coin_catalyst_log ORDER BY ts DESC LIMIT ?';
+          binding = [limit];
+        }
+        const { results } = await env.DB.prepare(query).bind(...binding).all();
+        return new Response(JSON.stringify({ ok: true, entries: results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
     if (url.pathname === '/whale-history' && request.method === 'GET') {
       try {
         const days = Math.min(90, parseInt(url.searchParams.get('days') || '7', 10));
