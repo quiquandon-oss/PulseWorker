@@ -634,6 +634,16 @@ const COIN_KEYWORDS = {
   BTC: [/\bbitcoin\b/i, /\bBTC\b/],
   LINK: [/\bchainlink\b/i, /\bLINK\b/],
 };
+// FIX: real bug caught before deploy, not after -- this constant already
+// existed but was declared INSIDE the main fetch() handler (function-local
+// to the 9 Magnificent stock-move logic), invisible to checkCoinCatalysts()
+// below, a separate top-level function. Would have thrown a runtime
+// ReferenceError the first time the cron actually ran -- node --check only
+// validates syntax, not scope, so this needed an explicit second look at
+// the declaration's actual indentation, not just a passing syntax check.
+// Promoted to genuine top-level scope so both places share one real source
+// of truth; the original local declaration below is now removed.
+const NINE_MAG_NEWS_THRESHOLD_PCT = 3.5; // 24h move magnitude that triggers a targeted news fetch
 async function checkCoinCatalysts(env) {
   for (const coin of ['BTC', 'LINK']) {
     try {
@@ -661,7 +671,8 @@ async function checkCoinCatalysts(env) {
       if (last && Date.now() - last.ts < 6 * 3600000) continue;
 
       // Price move over roughly the last 24h, from the authoritative price
-      // table (not derived from the prediction rows themselves).
+      // table (not derived from the prediction rows themselves). Computed
+      // BEFORE the magnitude gate below, since the gate needs it.
       const since = await env.DB.prepare(
         `SELECT ${priceField} as price FROM ${priceTable} WHERE ts >= ? ORDER BY ts ASC LIMIT 1`
       ).bind(Date.now() - 25 * 3600000).first();
@@ -669,6 +680,19 @@ async function checkCoinCatalysts(env) {
         `SELECT ${priceField} as price FROM ${priceTable} ORDER BY ts DESC LIMIT 1`
       ).first();
       const priceMovePct = (since && latest && since.price) ? ((latest.price - since.price) / since.price) * 100 : null;
+
+      // FIX: real bug, confirmed by checking what this actually logged in
+      // the wild after shipping -- is_regime_anomaly measures distance from
+      // any historical analog, which is NOT the same thing as "a notable
+      // price move." Both real entries logged before this fix were
+      // sub-1% BTC noise (-0.5%, -0.3%), while the actual motivating event
+      // (LINK's +7% Standard Chartered week) never triggered at all. A
+      // statistically novel PATTERN and a market-moving EVENT are different
+      // things -- only the latter is worth a news search and a Llama call.
+      // Reusing NINE_MAG_NEWS_THRESHOLD_PCT (3.5%) rather than inventing a
+      // new number -- same proven bar already used for exactly this
+      // "is this move big enough to explain" decision elsewhere in this file.
+      if (priceMovePct == null || Math.abs(priceMovePct) < NINE_MAG_NEWS_THRESHOLD_PCT) continue;
 
       // Targeted search -- crypto + regulatory feeds, the two most likely to
       // carry a coin-specific analyst report, listing, or partnership story.
@@ -686,29 +710,45 @@ async function checkCoinCatalysts(env) {
       const keywords = COIN_KEYWORDS[coin];
       const matched = allItems.find(item => keywords.some(kw => kw.test(item.title) || kw.test(item.description)));
 
-      let extractedReason = null;
+      let extractedReason = null, verdict = null;
       if (matched) {
-        const prompt = `${coin} just started behaving statistically unusually compared to its own recent history (CryptoPulse's own anomaly detector flagged it -- this is not a prediction, just "this looks different from anything recently seen"). Price has moved ${priceMovePct != null ? priceMovePct.toFixed(1) + '%' : 'an unknown amount'} over roughly the last 24 hours.
+        // FIX: real bug, confirmed from actual logged output -- the old
+        // open-ended "1-2 plain sentences" prompt let the model hedge both
+        // ways in the same breath ("this plausibly explains it... however
+        // no clear cause was identified" -- an actual line this produced).
+        // Now forces an explicit verdict as a separate, parseable first
+        // line, so the two modes (plausible vs unclear) can never blend
+        // into one contradictory sentence, and the backend can store a
+        // clean boolean-ish verdict instead of re-parsing free prose.
+        const prompt = `${coin} moved ${priceMovePct.toFixed(1)}% over roughly the last 24 hours -- large enough that CryptoPulse's own anomaly detector flagged it as unusual vs its recent history (not a prediction, just "this looks different from anything recently seen").
 
 A headline mentioning ${coin} was found in today's news feeds:
 "${matched.title}" (${matched.source})
 ${matched.description ? 'Summary: ' + matched.description : ''}
 
-In 1-2 plain sentences, say whether this headline plausibly explains the move. If it clearly could (a price target, partnership, listing, exploit, regulatory action), say so and name the topic in plain words. If it's unrelated or you're not confident it's the actual cause, say plainly that no clear cause was identified in this cycle's headlines -- do not force a connection that isn't well supported.`;
+Respond in exactly this format, two lines, nothing else:
+VERDICT: PLAUSIBLE or VERDICT: UNCLEAR
+REASON: one sentence
+
+Use PLAUSIBLE only if this headline is a real, specific, known type of price-moving event (an analyst price target, a partnership, an exchange listing, an exploit, a regulatory action) and could plausibly explain a move this size. Use UNCLEAR if the headline is unrelated, too vague, or you're not confident it's the actual cause -- do not write a PLAUSIBLE verdict and then hedge it in the reason, and do not write an UNCLEAR verdict and then argue it plausibly explains the move. Pick one and be consistent with it.`;
         try {
           const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
             messages: [{ role: 'user', content: prompt }],
-            max_tokens: 200,
+            max_tokens: 150,
           });
-          extractedReason = typeof result.response === 'string' ? result.response.trim() : null;
+          const raw = typeof result.response === 'string' ? result.response.trim() : '';
+          const verdictMatch = raw.match(/VERDICT:\s*(PLAUSIBLE|UNCLEAR)/i);
+          const reasonMatch = raw.match(/REASON:\s*(.+)/i); // no /s flag -- stop at the first line break, matches the "one sentence" instruction rather than greedily capturing any trailing model chatter
+          verdict = verdictMatch ? verdictMatch[1].toUpperCase() : null;
+          extractedReason = reasonMatch ? reasonMatch[1].trim() : (verdict ? null : raw || null); // fall back to raw text only if the format wasn't followed at all
         } catch (e) {
-          extractedReason = null; // best-effort -- a failed explanation shouldn't block logging the raw fact
+          extractedReason = null; verdict = null; // best-effort -- a failed explanation shouldn't block logging the raw fact
         }
       }
 
       await env.DB.prepare(
-        'INSERT INTO coin_catalyst_log (ts, coin, price_move_pct, headline_matched, headline_source, extracted_reason) VALUES (?,?,?,?,?,?)'
-      ).bind(Date.now(), coin, priceMovePct, matched ? matched.title : null, matched ? matched.source : null, extractedReason).run();
+        'INSERT INTO coin_catalyst_log (ts, coin, price_move_pct, headline_matched, headline_source, extracted_reason, verdict) VALUES (?,?,?,?,?,?,?)'
+      ).bind(Date.now(), coin, priceMovePct, matched ? matched.title : null, matched ? matched.source : null, extractedReason, verdict).run();
     } catch (err) {
       // Best-effort per coin -- one coin's check failing (a feed down, a
       // malformed row) should never block the other coin's check.
@@ -1051,7 +1091,10 @@ export default {
     // IPs specifically, but this is inherently less stable than a real
     // published API and may need re-checking if it stops working. ----
     const NINE_MAG_SYMBOLS = ['NVDA', 'AVGO', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'SPCX'];
-    const NINE_MAG_NEWS_THRESHOLD_PCT = 3.5; // 24h move magnitude that triggers a targeted news fetch
+    // NINE_MAG_NEWS_THRESHOLD_PCT now declared at top-level (see near
+    // COIN_KEYWORDS above) -- shared with checkCoinCatalysts(), which needs
+    // the same threshold. Removed the duplicate that used to be declared
+    // right here.
     if (url.pathname === '/stock-proxy' && request.method === 'GET') {
       // ?granularity=intraday — 5-minute candles over the current/most
       // recent trading session, for the 24H tab specifically. Separate
