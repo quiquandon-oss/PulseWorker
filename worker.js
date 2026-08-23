@@ -494,7 +494,7 @@ FOUFI_JSON: {"market_summary":"...","macro":{"lean":"bullish|bearish|neutral","t
     const status = summaryJson && !geminiError && !summaryJson.raw ? 'ok' : (summaryJson?.raw ? 'unstructured' : 'error');
     const now = Date.now();
     await env.DB.prepare(
-      'INSERT OR REPLACE INTO foufi_digest (video_id, published_ts, title, url, transcript_status, summary_json, overall_lean, fetched_ts, video_type, special_edition) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      'INSERT OR REPLACE INTO foufi_digest (video_id, published_ts, title, url, transcript_status, summary_json, overall_lean, fetched_ts, video_type, special_edition, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).bind(
       video.videoId,
       video.published ? new Date(video.published).getTime() : null,
@@ -505,7 +505,8 @@ FOUFI_JSON: {"market_summary":"...","macro":{"lean":"bullish|bearish|neutral","t
       overallLean,
       now,
       videoType,
-      specialEdition
+      specialEdition,
+      geminiError
     ).run();
 
     return { ok: true, video, videoType, specialEdition, status, geminiError, summary: summaryJson };
