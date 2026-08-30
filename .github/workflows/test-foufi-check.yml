@@ -1,0 +1,21 @@
+name: Test Foufi Check (temporary diagnostic)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Force a real Foufi check against the live worker
+        run: |
+          curl -sS "https://sentiment-ff75.quiquandon.workers.dev/foufi-check?force=1" | tee response.json
+      - name: Fail the job if the response indicates an error, so it's visible at a glance
+        run: |
+          if grep -q '"ok":false\|"error"' response.json; then
+            echo "Response indicates a failure:"
+            cat response.json
+            exit 1
+          fi
+          echo "Response looks successful:"
+          cat response.json
