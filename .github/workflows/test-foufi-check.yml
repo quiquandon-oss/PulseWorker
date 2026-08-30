@@ -7,15 +7,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Force a real Foufi check against the live worker
+      - name: Force a real Foufi check against the live worker and surface the response as an annotation
         run: |
-          curl -sS "https://sentiment-ff75.quiquandon.workers.dev/foufi-check?force=1" | tee response.json
-      - name: Fail the job if the response indicates an error, so it's visible at a glance
-        run: |
-          if grep -q '"ok":false\|"error"' response.json; then
-            echo "Response indicates a failure:"
-            cat response.json
+          RESPONSE=$(curl -sS "https://sentiment-ff75.quiquandon.workers.dev/foufi-check?force=1")
+          echo "$RESPONSE"
+          # Push the full response into a GitHub annotation so it's
+          # retrievable via the Checks API even without raw log access.
+          SINGLE_LINE=$(echo "$RESPONSE" | tr '\n' ' ')
+          echo "::notice title=Foufi check response::${SINGLE_LINE}"
+          if echo "$RESPONSE" | grep -q '"ok":false\|"transcript_status":"error"'; then
+            echo "::error title=Foufi check FAILED::${SINGLE_LINE}"
             exit 1
           fi
-          echo "Response looks successful:"
-          cat response.json
