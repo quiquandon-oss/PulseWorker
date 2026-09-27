@@ -6,6 +6,17 @@ on:
         description: "Yahoo Finance range parameter for equity/macro history (e.g. 2y, 1y, 6mo)"
         required: false
         default: "2y"
+  # GitHub's workflow_dispatch API only accepts dispatches for workflow
+  # files that already exist on the repo's default branch, even when
+  # targeting a different ref. This workflow intentionally lives only on
+  # the research branch (the task requires changes to stay isolated
+  # there, with no merge to main), so a push trigger scoped to that one
+  # branch is used instead to kick off the initial run. The workflow's
+  # own auto-generated report commit includes "[skip ci]", which GitHub
+  # recognizes to skip triggering a new run, so this does not loop.
+  push:
+    branches:
+      - claude/ai-capital-rotation-research
 
 permissions:
   contents: write
@@ -27,7 +38,7 @@ jobs:
         run: cd research && python -m pytest -q
 
       - name: Fetch live equity/macro/ETF data and run analysis
-        run: cd research && python run_analysis.py --fetch-live --range "${{ inputs.yahoo_range }}"
+        run: cd research && python run_analysis.py --fetch-live --range "${{ inputs.yahoo_range || '2y' }}"
 
       - name: Render report and charts
         run: cd research && python write_report.py
@@ -40,6 +51,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "research: regenerate AI-capital-rotation report (automated, research-only)"
+            git commit -m "research: regenerate AI-capital-rotation report (automated, research-only) [skip ci]"
             git push origin HEAD:${{ github.ref_name }}
           fi
