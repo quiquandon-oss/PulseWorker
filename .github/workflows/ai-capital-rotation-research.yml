@@ -1,0 +1,45 @@
+name: AI Capital Rotation Research (manual, research-only)
+on:
+  workflow_dispatch:
+    inputs:
+      yahoo_range:
+        description: "Yahoo Finance range parameter for equity/macro history (e.g. 2y, 1y, 6mo)"
+        required: false
+        default: "2y"
+
+permissions:
+  contents: write
+
+jobs:
+  run-research:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: pip install pytest
+
+      - name: Run deterministic test suite
+        run: cd research && python -m pytest -q
+
+      - name: Fetch live equity/macro/ETF data and run analysis
+        run: cd research && python run_analysis.py --fetch-live --range "${{ inputs.yahoo_range }}"
+
+      - name: Render report and charts
+        run: cd research && python write_report.py
+
+      - name: Commit generated report to this branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f research/output/report.json research/output/report.md research/output/charts
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "research: regenerate AI-capital-rotation report (automated, research-only)"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
