@@ -942,6 +942,62 @@ async function getHlOiReading(env, now = Date.now()) {
   return { ...base, status: 'OK', latest_ts: latest.ts, prior_ts: prior.ts, open_interest: latest.open_interest, mark_px: latest.mark_px, ...scoreHlOi(latest, prior) };
 }
 
+// ---------- Research-only source snapshots (EXP-028, not in the composite) ----------
+// Hourly raw values for candidate sources on the owner's roadmap, so they can
+// be evaluated later against forward BTC returns. Never weighted, never read
+// by the composite. A failed or malformed fetch stores nothing for that hour.
+async function ensureResearchSnapshotTable(env) {
+  await env.DB.prepare(
+    'CREATE TABLE IF NOT EXISTS research_source_snapshots (ts INTEGER NOT NULL, source TEXT NOT NULL, value REAL NOT NULL, PRIMARY KEY (ts, source))'
+  ).run();
+}
+
+function parseDeribitDvol(payload) {
+  const rows = payload && payload.result && payload.result.data;
+  if (!Array.isArray(rows) || !rows.length) throw new Error('Deribit DVOL: no data');
+  const last = rows[rows.length - 1];
+  const close = Number(last[4]);
+  if (!Number.isFinite(close) || close <= 0) throw new Error(`Deribit DVOL: invalid close ${last[4]}`);
+  return close;
+}
+
+function parseLlamaUsdtSupply(payload) {
+  const assets = payload && payload.peggedAssets;
+  if (!Array.isArray(assets)) throw new Error('DeFiLlama: no peggedAssets');
+  const usdt = assets.find(a => a.symbol === 'USDT' && String(a.id) === '1');
+  const v = usdt && usdt.circulating && Number(usdt.circulating.peggedUSD);
+  if (!Number.isFinite(v) || v <= 0) throw new Error('DeFiLlama: USDT circulating missing');
+  return v;
+}
+
+async function snapshotResearchSources(env, now = Date.now()) {
+  const ts = Math.floor(now / 3600000) * 3600000;
+  const jobs = [
+    ['deribit_dvol_btc', async () => {
+      const url = `https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&start_timestamp=${now - 3 * 3600000}&end_timestamp=${now}&resolution=3600`;
+      const r = await fetch(url); if (!r.ok) throw new Error(`Deribit HTTP ${r.status}`);
+      return parseDeribitDvol(await r.json());
+    }],
+    ['defillama_usdt_supply', async () => {
+      const r = await fetch('https://stablecoins.llama.fi/stablecoins?includePrices=false'); if (!r.ok) throw new Error(`DeFiLlama HTTP ${r.status}`);
+      return parseLlamaUsdtSupply(await r.json());
+    }],
+  ];
+  await ensureResearchSnapshotTable(env);
+  const out = {};
+  for (const [source, fetchValue] of jobs) {
+    try {
+      const value = await fetchValue();
+      await env.DB.prepare('INSERT OR IGNORE INTO research_source_snapshots (ts, source, value) VALUES (?, ?, ?)').bind(ts, source, value).run();
+      out[source] = value;
+    } catch (e) {
+      console.error(`Research snapshot ${source} failed:`, e.message);
+      out[source] = null;
+    }
+  }
+  return out;
+}
+
 export default {
   async scheduled(event, env, ctx) {
     // Three crons share this handler now (see wrangler.toml): "0 6,18 * * *"
@@ -959,6 +1015,7 @@ export default {
     } else if (event.cron === '0 * * * *') {
       ctx.waitUntil(checkFoufiDigest(env));
       ctx.waitUntil(snapshotHyperliquidOi(env).catch(e => console.error('Hyperliquid OI snapshot failed:', e.message)));
+      ctx.waitUntil(snapshotResearchSources(env).catch(e => console.error('Research source snapshots failed:', e.message)));
     } else {
       ctx.waitUntil(runTechnicalEvaluation(env));
     }
