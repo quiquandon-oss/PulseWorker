@@ -998,6 +998,190 @@ async function snapshotResearchSources(env, now = Date.now()) {
   return out;
 }
 
+// ---------- V1 sentiment-weight adaptation (SHADOW MODE) ----------
+// Bounded, audited proposals for the V1 composite's source weights, based on
+// each source's measured INCREMENTAL value: the composite's directional hit
+// rate on the next-24h BTC move with vs without that source, on the same
+// samples (so a redundant source scores ~0). Nothing here changes the live
+// composite: proposals are recorded with their evidence, and only the owner
+// can apply them through V1 Settings (existing per-browser overrides; "Reset
+// to defaults" is the rollback). Each proposal is later scored ONLY on data
+// that arrived after it was made (out of sample) against the unchanged
+// default weights. The defaults below mirror CryptoPulse/index.html
+// COMPOSITE_SOURCES_DEFAULTS at the version named here.
+const SENTIMENT_DEFAULT_WEIGHTS_VERSION = '2026-10-11-hloi';
+const SENTIMENT_DEFAULT_WEIGHTS = {
+  fng: [14, 1.0], funding: [15, 1.0], longshort: [10, 0.5], global: [6, 1.0], cryptonews: [15, 0.7], macrogeo: [8, 0.7],
+  geopolitics: [10, 0.6], regulatory: [12, 0.6], sosovalue: [15, 0.7], onchain: [8, 0.5], oil: [6, 0.6], yield10y: [5, 0.6],
+  usd: [8, 0.6], nasdaq: [6, 0.7], sp500: [6, 0.7], ninemag: [8, 0.6], foufi: [6, 0.4], etfflows: [10, 0.8],
+  hypefunding: [4, 0.4], gold: [5, 0.5], strc: [5, 0.35], hloi: [4, 0.3],
+};
+const WEIGHT_ADAPT_POLICY = {
+  mode: 'shadow', minFactor: 0.5, maxFactor: 1.5, maxStepPct: 10, maxSharePct: 20,
+  minSamples: 30, minDeltaPts: 2, sampleSpacingHours: 6, horizonHours: 24, toleranceHours: 2,
+};
+
+async function ensureWeightAdaptationTable(env) {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS sentiment_weight_adaptation (
+       run_ts INTEGER PRIMARY KEY, mode TEXT NOT NULL, defaults_version TEXT NOT NULL, policy_json TEXT NOT NULL,
+       prev_weights_json TEXT NOT NULL, new_weights_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+       reason TEXT NOT NULL, n_samples INTEGER NOT NULL, changed INTEGER NOT NULL)`
+  ).run();
+}
+
+// rows: [{ts, btc_price, sources}] -> one sample per spacing window with the
+// BTC return over the following horizon (nearest row within tolerance).
+function buildAdaptationSamples(rows, policy = WEIGHT_ADAPT_POLICY) {
+  const H = 3600000, sorted = rows.filter(r => r.btc_price > 0 && r.sources).sort((a, b) => a.ts - b.ts);
+  const out = []; let lastTs = -Infinity, j = 0;
+  for (const r of sorted) {
+    if (r.ts - lastTs < policy.sampleSpacingHours * H) continue;
+    const target = r.ts + policy.horizonHours * H;
+    while (j < sorted.length - 1 && sorted[j].ts < target) j++;
+    const cands = [sorted[j - 1], sorted[j]].filter(x => x && Math.abs(x.ts - target) <= policy.toleranceHours * H);
+    if (!cands.length) continue;
+    const fwd = cands.sort((a, b) => Math.abs(a.ts - target) - Math.abs(b.ts - target))[0];
+    out.push({ ts: r.ts, sources: r.sources, fwdReturn: fwd.btc_price / r.btc_price - 1 });
+    lastTs = r.ts;
+  }
+  return out;
+}
+
+// Same arithmetic as V1's computeComposite (weight x confidence over the
+// sources present), without the Foufi driver boost.
+function compositeFrom(sources, weights, exclude = null) {
+  let num = 0, den = 0;
+  for (const [id, v] of Object.entries(sources)) {
+    if (id === exclude || !weights[id] || typeof v !== 'number' || !Number.isFinite(v)) continue;
+    const w = weights[id][0] * weights[id][1]; num += v * w; den += w;
+  }
+  return den > 0 ? num / den : null;
+}
+
+function hitRate(samples, weights, exclude = null) {
+  let hits = 0, n = 0;
+  for (const s of samples) {
+    const c = compositeFrom(s.sources, weights, exclude);
+    // Neutral (within float noise of 50) makes no directional call.
+    if (c == null || Math.abs(c - 50) < 1e-9 || s.fwdReturn === 0) continue;
+    n++; if ((c > 50) === (s.fwdReturn > 0)) hits++;
+  }
+  return { n, hitPct: n ? (hits / n) * 100 : null };
+}
+
+function effectiveShares(weights) {
+  const tot = Object.values(weights).reduce((a, [w, c]) => a + w * c, 0) || 1;
+  return Object.fromEntries(Object.entries(weights).map(([id, [w, c]]) => [id, (w * c / tot) * 100]));
+}
+
+// One bounded step from `current` given the samples. Returns the proposal and
+// per-source evidence; never moves outside [min,max]xdefault, never more than
+// maxStepPct per run, never above maxSharePct effective share.
+function proposeWeights(samples, current, defaults = SENTIMENT_DEFAULT_WEIGHTS, policy = WEIGHT_ADAPT_POLICY) {
+  const evidence = {};
+  const next = Object.fromEntries(Object.entries(current).map(([k, v]) => [k, [...v]]));
+  for (const id of Object.keys(defaults)) {
+    const withIt = samples.filter(s => typeof s.sources[id] === 'number');
+    if (withIt.length < policy.minSamples) {
+      evidence[id] = { samples: withIt.length, decision: 'insufficient_samples' };
+      continue;
+    }
+    const full = hitRate(withIt, current), without = hitRate(withIt, current, id);
+    const delta = full.hitPct != null && without.hitPct != null ? full.hitPct - without.hitPct : null;
+    const e = { samples: withIt.length, hit_with: full.hitPct, hit_without: without.hitPct, delta_pts: delta };
+    if (delta == null || Math.abs(delta) < policy.minDeltaPts) { evidence[id] = { ...e, decision: 'no_change' }; continue; }
+    const step = Math.sign(delta) * Math.min(policy.maxStepPct, Math.abs(delta)) / 100;
+    const [dw] = defaults[id];
+    const target = Math.min(dw * policy.maxFactor, Math.max(dw * policy.minFactor, current[id][0] * (1 + step)));
+    next[id][0] = Math.round(target * 100) / 100;
+    evidence[id] = { ...e, decision: next[id][0] === current[id][0] ? 'at_bound' : (step > 0 ? 'increase' : 'decrease') };
+  }
+  // Concentration cap: scale any source above maxSharePct back down (bounded below by minFactor).
+  for (let pass = 0; pass < 5; pass++) {
+    const shares = effectiveShares(next); let capped = false;
+    for (const [id, sh] of Object.entries(shares)) {
+      if (sh > policy.maxSharePct) {
+        const floor = defaults[id][0] * policy.minFactor;
+        next[id][0] = Math.max(floor, Math.round(next[id][0] * (policy.maxSharePct / sh) * 100) / 100);
+        evidence[id] = { ...(evidence[id] || {}), decision: 'capped_share' }; capped = true;
+      }
+    }
+    if (!capped) break;
+  }
+  const changed = Object.keys(next).filter(id => next[id][0] !== current[id][0]);
+  return { weights: next, evidence, changed };
+}
+
+async function loadSentimentObservations(env) {
+  const parse = (j) => { try { return JSON.parse(j); } catch { return null; } };
+  const rows = new Map();
+  try {
+    const { results } = await env.DB.prepare('SELECT observation_ts AS ts, btc_price, sources_json FROM research_sentiment_archive').all();
+    for (const r of results) rows.set(r.ts, { ts: r.ts, btc_price: r.btc_price, sources: parse(r.sources_json) });
+  } catch (_) { /* archive table absent: history only */ }
+  const { results } = await env.DB.prepare('SELECT ts, btc_price, sources_json FROM history').all();
+  for (const r of results) if (!rows.has(r.ts)) rows.set(r.ts, { ts: r.ts, btc_price: r.btc_price, sources: parse(r.sources_json) });
+  return [...rows.values()];
+}
+
+async function runWeightAdaptation(env, now = Date.now()) {
+  await ensureWeightAdaptationTable(env);
+  const last = await env.DB.prepare('SELECT new_weights_json, defaults_version FROM sentiment_weight_adaptation ORDER BY run_ts DESC LIMIT 1').first();
+  // Restart from the defaults whenever V1's default weights changed.
+  const current = last && last.defaults_version === SENTIMENT_DEFAULT_WEIGHTS_VERSION ? JSON.parse(last.new_weights_json) : SENTIMENT_DEFAULT_WEIGHTS;
+  const samples = buildAdaptationSamples(await loadSentimentObservations(env));
+  const { weights, evidence, changed } = samples.length >= WEIGHT_ADAPT_POLICY.minSamples
+    ? proposeWeights(samples, current) : { weights: current, evidence: {}, changed: [] };
+  const reason = samples.length < WEIGHT_ADAPT_POLICY.minSamples
+    ? `insufficient evidence: ${samples.length} of ${WEIGHT_ADAPT_POLICY.minSamples} spaced samples with a resolved 24h outcome`
+    : changed.length ? `adjusted ${changed.join(', ')} within policy bounds` : 'no source cleared the minimum incremental-value threshold';
+  await env.DB.prepare(
+    'INSERT OR REPLACE INTO sentiment_weight_adaptation (run_ts, mode, defaults_version, policy_json, prev_weights_json, new_weights_json, evidence_json, reason, n_samples, changed) VALUES (?,?,?,?,?,?,?,?,?,?)'
+  ).bind(now, WEIGHT_ADAPT_POLICY.mode, SENTIMENT_DEFAULT_WEIGHTS_VERSION, JSON.stringify(WEIGHT_ADAPT_POLICY), JSON.stringify(current),
+    JSON.stringify(weights), JSON.stringify(evidence), reason, samples.length, changed.length).run();
+  return { run_ts: now, n_samples: samples.length, changed, reason };
+}
+
+// Out-of-sample: score the latest proposal only on samples after it was made.
+function evaluateProposalOutOfSample(samples, proposal, defaults = SENTIMENT_DEFAULT_WEIGHTS, policy = WEIGHT_ADAPT_POLICY) {
+  const after = samples.filter(s => s.ts > proposal.run_ts);
+  const base = hitRate(after, defaults), shadow = hitRate(after, proposal.weights);
+  const n = Math.min(base.n, shadow.n);
+  let verdict = 'INSUFFICIENT_DATA';
+  if (n >= policy.minSamples) {
+    const d = shadow.hitPct - base.hitPct;
+    verdict = d >= policy.minDeltaPts ? 'IMPROVED' : d <= -policy.minDeltaPts ? 'WORSE' : 'NO_DIFFERENCE';
+  }
+  return { samples_after: n, baseline_hit_pct: base.hitPct, shadow_hit_pct: shadow.hitPct, verdict,
+    next_action: verdict === 'IMPROVED' ? 'eligible for owner approval' : verdict === 'WORSE' ? 'rollback: keep defaults' : 'continue shadow' };
+}
+
+async function getWeightAdaptation(env, now = Date.now()) {
+  await ensureWeightAdaptationTable(env);
+  const { results } = await env.DB.prepare('SELECT * FROM sentiment_weight_adaptation ORDER BY run_ts DESC LIMIT 10').all();
+  const history = results.map(r => ({ run_ts: r.run_ts, mode: r.mode, defaults_version: r.defaults_version, reason: r.reason,
+    n_samples: r.n_samples, changed: r.changed, weights: JSON.parse(r.new_weights_json), prev_weights: JSON.parse(r.prev_weights_json),
+    evidence: JSON.parse(r.evidence_json) }));
+  const latest = history[0] || null;
+  // Before the first scheduled run: an unsaved preview of what a run would propose now.
+  let preview = null;
+  if (!latest) {
+    const samples = buildAdaptationSamples(await loadSentimentObservations(env));
+    const p = samples.length >= WEIGHT_ADAPT_POLICY.minSamples ? proposeWeights(samples, SENTIMENT_DEFAULT_WEIGHTS) : null;
+    preview = { persisted: false, n_samples: samples.length, changed: p ? p.changed : [], evidence: p ? p.evidence : {},
+      reason: p ? (p.changed.length ? `would adjust ${p.changed.join(', ')}` : 'no source clears the minimum incremental-value threshold')
+        : `insufficient evidence: ${samples.length} of ${WEIGHT_ADAPT_POLICY.minSamples} spaced samples with a resolved 24h outcome` };
+  }
+  let evaluation = null;
+  if (latest && latest.changed) {
+    evaluation = evaluateProposalOutOfSample(buildAdaptationSamples(await loadSentimentObservations(env)), latest);
+  }
+  return { ok: true, mode: WEIGHT_ADAPT_POLICY.mode, policy: WEIGHT_ADAPT_POLICY, defaults_version: SENTIMENT_DEFAULT_WEIGHTS_VERSION,
+    defaults: SENTIMENT_DEFAULT_WEIGHTS, default_shares_pct: effectiveShares(SENTIMENT_DEFAULT_WEIGHTS), latest, preview, evaluation,
+    history: history.map(({ evidence, prev_weights, ...h }) => h), generated_ts: now };
+}
+
 export default {
   async scheduled(event, env, ctx) {
     // Three crons share this handler now (see wrangler.toml): "0 6,18 * * *"
@@ -1018,6 +1202,10 @@ export default {
       ctx.waitUntil(snapshotResearchSources(env).catch(e => console.error('Research source snapshots failed:', e.message)));
     } else {
       ctx.waitUntil(runTechnicalEvaluation(env));
+      // Once a day (06:00 tick of "0 6,18 * * *"): shadow weight proposal.
+      if (new Date(event.scheduledTime || Date.now()).getUTCHours() === 6) {
+        ctx.waitUntil(runWeightAdaptation(env).catch(e => console.error('Weight adaptation failed:', e.message)));
+      }
     }
   },
 
@@ -1028,6 +1216,15 @@ export default {
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, X-App-Secret',
     };
+
+    // GET /weight-adaptation -- read-only: shadow weight proposals, evidence, out-of-sample check.
+    if (url.pathname === '/weight-adaptation' && request.method === 'GET') {
+      try {
+        return new Response(JSON.stringify(await getWeightAdaptation(env)), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: String(err) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
 
     // GET /hl-oi -- read-only scored reading for the V1 composite's "hloi" source.
     if (url.pathname === '/hl-oi' && request.method === 'GET') {
