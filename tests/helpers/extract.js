@@ -30,7 +30,7 @@ export function extractFunctions(...names) {
   const src = getSource();
   const pieces = [];
   for (const name of names) {
-    const startMatch = src.match(new RegExp(`function\\s+${name}\\s*\\(`));
+    const startMatch = src.match(new RegExp(`(async\\s+)?function\\s+${name}\\s*\\(`));
     if (!startMatch) throw new Error(`Could not find "function ${name}(" in worker.js -- was it renamed, removed, or turned into an arrow function?`);
     const startIdx = startMatch.index;
     const braceStart = src.indexOf('{', startIdx);
@@ -48,7 +48,7 @@ export function extractFunctions(...names) {
 export function evalInScope(source, extraGlobals = {}) {
   const sandbox = { console, ...extraGlobals };
   const keys = Object.keys(sandbox);
-  const names = [...source.matchAll(/^function\s+([A-Za-z_$][\w$]*)\s*\(/gm)].map(m => m[1]);
+  const names = [...source.matchAll(/^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm)].map(m => m[1]);
   const fn = new Function(...keys, `${source}\nreturn { ${names.join(',')} };`);
   return fn(...keys.map(k => sandbox[k]));
 }

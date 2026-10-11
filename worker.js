@@ -870,6 +870,78 @@ const FRED_SERIES_LABELS = {
   SP500: 'S&P 500',
 };
 
+// ---------- Hyperliquid BTC open interest -> V1 composite source "hloi" ----------
+// Hyperliquid's public API has no OI history, so the hourly cron stores one
+// BTC snapshot per hour (OI in coins, mark price) and /hl-oi scores the last
+// 24h from those snapshots. Rule (hloi-v1, a documented heuristic, NOT a
+// validated model): the 24h price move sets the direction; OI growth over the
+// same 24h raises conviction (new positions behind the move) and OI decline
+// lowers it (move driven by closing positions):
+//   conviction = clamp(1 + oiChange% / 10, 0.5, 1.5)
+//   score      = clamp(50 + 5 * priceChange% * conviction, 0, 100)
+// Missing, stale (>2h) or <24h of history is reported as such, never as 50.
+const HL_OI_SCORE_VERSION = 'hloi-v1';
+const HL_OI_MAX_LATEST_AGE_MS = 2 * 60 * 60 * 1000;
+const HL_OI_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+const HL_OI_LOOKBACK_TOLERANCE_MS = 90 * 60 * 1000;
+const HL_OI_RETENTION_MS = 45 * 24 * 60 * 60 * 1000;
+
+async function ensureHlOiTable(env) {
+  await env.DB.prepare(
+    'CREATE TABLE IF NOT EXISTS hl_oi_snapshots (ts INTEGER PRIMARY KEY, coin TEXT NOT NULL, open_interest REAL NOT NULL, mark_px REAL NOT NULL)'
+  ).run();
+}
+
+function parseHlBtcCtx(payload) {
+  if (!Array.isArray(payload) || payload.length < 2) throw new Error('unexpected metaAndAssetCtxs shape');
+  const [meta, ctxs] = payload;
+  const idx = ((meta && meta.universe) || []).findIndex(u => u.name === 'BTC');
+  if (idx < 0 || !ctxs[idx]) throw new Error('BTC not in Hyperliquid universe');
+  const oi = parseFloat(ctxs[idx].openInterest), px = parseFloat(ctxs[idx].markPx);
+  if (!Number.isFinite(oi) || oi <= 0 || !Number.isFinite(px) || px <= 0) throw new Error(`invalid BTC ctx oi=${ctxs[idx].openInterest} px=${ctxs[idx].markPx}`);
+  return { open_interest: oi, mark_px: px };
+}
+
+async function snapshotHyperliquidOi(env, now = Date.now()) {
+  const res = await fetch('https://api.hyperliquid.xyz/info', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'metaAndAssetCtxs' }),
+  });
+  if (!res.ok) throw new Error(`Hyperliquid info HTTP ${res.status}`);
+  const { open_interest, mark_px } = parseHlBtcCtx(await res.json());
+  await ensureHlOiTable(env);
+  const ts = Math.floor(now / 60000) * 60000;
+  await env.DB.prepare('INSERT OR IGNORE INTO hl_oi_snapshots (ts, coin, open_interest, mark_px) VALUES (?, ?, ?, ?)')
+    .bind(ts, 'BTC', open_interest, mark_px).run();
+  await env.DB.prepare('DELETE FROM hl_oi_snapshots WHERE ts < ?').bind(now - HL_OI_RETENTION_MS).run();
+  return { ts, open_interest, mark_px };
+}
+
+function scoreHlOi(latest, prior) {
+  const oiChangePct = (latest.open_interest / prior.open_interest - 1) * 100;
+  const priceChangePct = (latest.mark_px / prior.mark_px - 1) * 100;
+  const conviction = Math.min(1.5, Math.max(0.5, 1 + oiChangePct / 10));
+  const score = Math.min(100, Math.max(0, 50 + 5 * priceChangePct * conviction));
+  return { score, oi_change_pct: oiChangePct, price_change_pct: priceChangePct, conviction };
+}
+
+async function getHlOiReading(env, now = Date.now()) {
+  await ensureHlOiTable(env);
+  const latest = await env.DB.prepare('SELECT ts, open_interest, mark_px FROM hl_oi_snapshots ORDER BY ts DESC LIMIT 1').first();
+  const base = { ok: true, source: 'hloi', version: HL_OI_SCORE_VERSION };
+  if (!latest) return { ...base, status: 'NO_DATA', reason: 'No Hyperliquid OI snapshot stored yet' };
+  if (now - latest.ts > HL_OI_MAX_LATEST_AGE_MS) {
+    return { ...base, status: 'STALE', latest_ts: latest.ts, reason: `Latest OI snapshot is ${((now - latest.ts) / 3600000).toFixed(1)}h old (>2h)` };
+  }
+  const target = latest.ts - HL_OI_LOOKBACK_MS;
+  const prior = await env.DB.prepare(
+    'SELECT ts, open_interest, mark_px FROM hl_oi_snapshots WHERE ts BETWEEN ? AND ? ORDER BY ABS(ts - ?) ASC LIMIT 1'
+  ).bind(target - HL_OI_LOOKBACK_TOLERANCE_MS, target + HL_OI_LOOKBACK_TOLERANCE_MS, target).first();
+  if (!prior) {
+    return { ...base, status: 'INSUFFICIENT_HISTORY', latest_ts: latest.ts, reason: 'No OI snapshot within 90 min of 24h before the latest one yet' };
+  }
+  return { ...base, status: 'OK', latest_ts: latest.ts, prior_ts: prior.ts, open_interest: latest.open_interest, mark_px: latest.mark_px, ...scoreHlOi(latest, prior) };
+}
+
 export default {
   async scheduled(event, env, ctx) {
     // Three crons share this handler now (see wrangler.toml): "0 6,18 * * *"
@@ -886,6 +958,7 @@ export default {
       ctx.waitUntil(checkCoinCatalysts(env));
     } else if (event.cron === '0 * * * *') {
       ctx.waitUntil(checkFoufiDigest(env));
+      ctx.waitUntil(snapshotHyperliquidOi(env).catch(e => console.error('Hyperliquid OI snapshot failed:', e.message)));
     } else {
       ctx.waitUntil(runTechnicalEvaluation(env));
     }
@@ -898,6 +971,15 @@ export default {
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, X-App-Secret',
     };
+
+    // GET /hl-oi -- read-only scored reading for the V1 composite's "hloi" source.
+    if (url.pathname === '/hl-oi' && request.method === 'GET') {
+      try {
+        return new Response(JSON.stringify(await getHlOiReading(env)), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: String(err) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
     // ---- GET /news-proxy?source=crypto|macro|geopolitics|regulatory ----
