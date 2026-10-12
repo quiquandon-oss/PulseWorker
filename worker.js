@@ -998,6 +998,210 @@ async function snapshotResearchSources(env, now = Date.now()) {
   return out;
 }
 
+// ---------- Risk Regime Shock -> V1 composite source "riskregime" ----------
+// The MARKET component of the Risk Regime Shock research (PulseWorkerV2
+// research/risk_regime_shock.py, branch claude/sweet-meitner-66ntx8): a broad,
+// abnormal cross-asset move, read from Hyperliquid hourly candles. Rule
+// rrs-v1, a documented heuristic, NOT a validated model:
+//   - abnormal: an instrument's 6h return lies outside its own trailing 7-day
+//     5th-95th percentile (>= 120 of 168 hourly points), as in the research;
+//   - shock: >= 3 of the 7 breadth instruments abnormal (research threshold);
+//   - direction: the a-priori "classic risk-off" signs (equity down, gold up,
+//     copper down, EUR/USD down, 10Y yield down); silver and oil count for
+//     breadth only. Each abnormal directional instrument votes risk-off or
+//     risk-on; the winning side must be confirmed by >= 2 asset groups;
+//   - score = 50 + 40 * (risk-on votes - risk-off votes) / measurable
+//     directional instruments, so 10..90; a calm, isolated or mixed market
+//     is a real neutral reading (50), not missing data.
+// The GDELT geopolitical component and the GEO x MARKET convergence state are
+// NOT used: the research found convergence at chance level (verdict
+// INSUFFICIENT DATA). Weekend/closed underlying markets, fewer than 5
+// measurable breadth instruments, or no fresh closed candle make the reading
+// unavailable (excluded from the composite), never a neutral 50. Every input
+// is a candle that CLOSED before the scoring hour (no look-ahead).
+const RRS_VERSION = 'rrs-v1';
+const RRS_HOUR_MS = 60 * 60 * 1000;
+const RRS_HORIZON_H = 6;
+const RRS_BASELINE_H = 7 * 24;
+const RRS_MIN_BASELINE_POINTS = 120;
+const RRS_MAX_CANDLE_AGE_MS = 2 * RRS_HOUR_MS;
+const RRS_ACTIVE_LOOKBACK_H = 6;
+const RRS_ABNORMAL_LO = 5, RRS_ABNORMAL_HI = 95;
+const RRS_SHOCK_MIN_BREADTH = 3;
+const RRS_MIN_MEASURABLE_BREADTH = 5;
+const RRS_MIN_CONFIRMING_GROUPS = 2;
+const RRS_SCORE_SPAN = 40;
+const RRS_FETCH_HOURS = RRS_BASELINE_H + RRS_HORIZON_H + 12;
+const RRS_MAX_READING_AGE_MS = 2 * RRS_HOUR_MS;
+const RRS_RETENTION_MS = 45 * 24 * RRS_HOUR_MS;
+const RRS_BASKET = [
+  { symbol: 'xyz:SP500', label: 'S&P 500', group: 'equity', riskOff: 'down', breadth: true },
+  { symbol: 'xyz:XYZ100', label: 'Nasdaq 100', group: 'equity', riskOff: 'down', breadth: false },
+  { symbol: 'xyz:GOLD', label: 'Gold', group: 'commodity', riskOff: 'up', breadth: true },
+  { symbol: 'xyz:SILVER', label: 'Silver', group: 'commodity', riskOff: null, breadth: true },
+  { symbol: 'xyz:COPPER', label: 'Copper', group: 'commodity', riskOff: 'down', breadth: true },
+  { symbol: 'xyz:BRENTOIL', label: 'Brent oil', group: 'commodity', riskOff: null, breadth: true },
+  { symbol: 'xyz:EUR', label: 'EUR/USD', group: 'fx', riskOff: 'down', breadth: true },
+  { symbol: 'para:10Y', label: 'US 10Y yield', group: 'rates', riskOff: 'down', breadth: true },
+];
+
+// candleSnapshot rows -> sorted, de-duplicated, validated candles. Throws on a
+// malformed payload so a broken response can never become a reading.
+function rrsParseCandles(rows) {
+  if (!Array.isArray(rows)) throw new Error('candleSnapshot: expected a list');
+  const seen = new Set(), out = [];
+  for (const r of rows) {
+    const c = { t: Number(r && r.t), T: Number(r && r.T), o: Number(r && r.o), h: Number(r && r.h), l: Number(r && r.l), c: Number(r && r.c), v: Number(r && r.v) };
+    if (![c.t, c.T, c.o, c.h, c.l, c.c, c.v].every(Number.isFinite) || c.c <= 0 || c.o <= 0 || c.T <= c.t) throw new Error('candleSnapshot: malformed candle');
+    if (seen.has(c.t)) continue;
+    seen.add(c.t); out.push(c);
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+
+function rrsPercentileRank(value, history) {
+  if (!history.length) return null;
+  let below = 0, equal = 0;
+  for (const h of history) { if (h < value) below++; else if (h === value) equal++; }
+  return Math.round(10000 * (below + 0.5 * equal) / history.length) / 100;
+}
+
+// US/CME session approximation used by the research: shut Friday 21:00 to
+// Sunday 22:00 UTC (holidays and the daily break not modelled).
+function rrsUnderlyingOpen(tsMs) {
+  const d = new Date(tsMs), wd = d.getUTCDay(), h = d.getUTCHours() + d.getUTCMinutes() / 60;
+  if (wd === 6) return false;
+  if (wd === 5 && h >= 21) return false;
+  if (wd === 0 && h < 22) return false;
+  return true;
+}
+
+// Point-in-time features of one instrument at scoringTs: only candles with
+// close time T < scoringTs are used.
+function rrsInstrumentFeatures(candles, scoringTs) {
+  const closed = candles.filter(c => c.T < scoringTs);
+  const last = closed[closed.length - 1];
+  if (!last) return { status: 'NO_DATA' };
+  const out = { last_close_ts: last.T + 1, age_min: Math.round((scoringTs - last.T) / 60000), close: last.c };
+  if (scoringTs - last.T > RRS_MAX_CANDLE_AGE_MS) return { ...out, status: 'STALE' };
+  const recent = closed.slice(-RRS_ACTIVE_LOOKBACK_H);
+  const active = recent.some(c => c.v > 0 || !(c.o === c.h && c.h === c.l && c.l === c.c));
+  if (!active) return { ...out, status: 'INACTIVE' };
+  const byT = new Map(closed.map(c => [c.T, c.c]));
+  const ret = (c) => { const p = byT.get(c.T - RRS_HORIZON_H * RRS_HOUR_MS); return p ? (c.c / p - 1) * 100 : null; };
+  const r = ret(last);
+  if (r == null) return { ...out, status: 'INSUFFICIENT_HISTORY' };
+  const base = [];
+  for (const c of closed) if (c.T < last.T && c.T > last.T - RRS_BASELINE_H * RRS_HOUR_MS) { const v = ret(c); if (v != null) base.push(v); }
+  if (base.length < RRS_MIN_BASELINE_POINTS) return { ...out, status: 'INSUFFICIENT_HISTORY', ret_6h: r, baseline_points: base.length };
+  const pct = rrsPercentileRank(r, base);
+  const abnormal = pct <= RRS_ABNORMAL_LO ? 'down' : pct >= RRS_ABNORMAL_HI ? 'up' : null;
+  return { ...out, status: 'OK', ret_6h: Math.round(r * 10000) / 10000, pct_6h: pct, baseline_points: base.length, abnormal };
+}
+
+// feats: { symbol: features } -> the rrs-v1 reading (pure, deterministic).
+function scoreRiskRegime(feats, scoringTs) {
+  const inputs = RRS_BASKET.map(b => {
+    const f = feats[b.symbol] || { status: 'NO_DATA' };
+    let vote = null;
+    if (f.status === 'OK' && f.abnormal && b.riskOff) vote = f.abnormal === b.riskOff ? 'risk_off' : 'risk_on';
+    return { symbol: b.symbol, label: b.label, group: b.group, risk_off_direction: b.riskOff, breadth: b.breadth, ...f, vote };
+  });
+  const base = { source: 'riskregime', version: RRS_VERSION, scoring_ts: scoringTs, underlying_open: rrsUnderlyingOpen(scoringTs), inputs };
+  const breadthOk = inputs.filter(i => i.breadth && i.status === 'OK');
+  const rejected = inputs.filter(i => i.status !== 'OK').map(i => `${i.label}: ${i.status}`);
+  if (!base.underlying_open) {
+    return { ...base, status: 'MARKETS_CLOSED', regime: null, rejected, reason: 'Underlying markets are shut (Fri 21:00 to Sun 22:00 UTC); Hyperliquid weekend prices are not the underlying market' };
+  }
+  if (breadthOk.length < RRS_MIN_MEASURABLE_BREADTH) {
+    return { ...base, status: 'INSUFFICIENT_DATA', regime: null, rejected, reason: `Only ${breadthOk.length} of 7 breadth instruments measurable (need ${RRS_MIN_MEASURABLE_BREADTH})` };
+  }
+  const directional = inputs.filter(i => i.status === 'OK' && i.risk_off_direction);
+  const breadth = breadthOk.filter(i => i.abnormal).length;
+  const off = directional.filter(i => i.vote === 'risk_off'), on = directional.filter(i => i.vote === 'risk_on');
+  const groupsOf = (xs) => [...new Set(xs.map(i => i.group))];
+  const counts = { breadth_abnormal: breadth, breadth_measurable: breadthOk.length, directional_measurable: directional.length,
+    risk_off_votes: off.length, risk_on_votes: on.length, risk_off_groups: groupsOf(off), risk_on_groups: groupsOf(on) };
+  const describe = (xs) => xs.map(i => `${i.label} ${i.abnormal} (${i.pct_6h}th pct)`).join(', ');
+  const ok = (score, regime, explanation) => ({ ...base, status: 'OK', score, regime, explanation, counts, rejected });
+  if (breadth < RRS_SHOCK_MIN_BREADTH) {
+    return ok(50, breadth === 0 ? 'CALM' : 'ISOLATED',
+      breadth === 0 ? 'No basket instrument is outside its normal 6h range: no cross-asset regime shock.'
+        : `${breadth} of ${breadthOk.length} instruments abnormal (need ${RRS_SHOCK_MIN_BREADTH} for a shock): isolated moves, not a regime shock.`);
+  }
+  const net = on.length - off.length;
+  const winners = net > 0 ? on : off;
+  if (net === 0 || groupsOf(winners).length < RRS_MIN_CONFIRMING_GROUPS) {
+    return ok(50, net === 0 ? 'MIXED' : 'UNCONFIRMED',
+      net === 0 ? `Broad abnormal moves (${breadth} instruments) but risk-off and risk-on votes cancel (${off.length} vs ${on.length}): contradictory regime.`
+        : `Broad abnormal moves (${breadth} instruments) but the ${net > 0 ? 'risk-on' : 'risk-off'} side is confirmed by only one asset group.`);
+  }
+  const score = Math.round((50 + RRS_SCORE_SPAN * net / directional.length) * 10) / 10;
+  return ok(score, net > 0 ? 'RISK_ON_SHOCK' : 'RISK_OFF_SHOCK',
+    `${net > 0 ? 'Risk-on' : 'Risk-off'} cross-asset shock: ${breadth} of ${breadthOk.length} instruments abnormal; ${net > 0 ? 'risk-on' : 'risk-off'} votes ${winners.length} vs ${(net > 0 ? off : on).length} across ${groupsOf(winners).join(', ')} (${describe(winners)}).`);
+}
+
+async function rrsFetchCandles(symbol, scoringTs) {
+  const res = await fetch('https://api.hyperliquid.xyz/info', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'candleSnapshot', req: { coin: symbol, interval: '1h', startTime: scoringTs - RRS_FETCH_HOURS * RRS_HOUR_MS, endTime: scoringTs } }),
+  });
+  if (!res.ok) throw new Error(`Hyperliquid candleSnapshot ${symbol} HTTP ${res.status}`);
+  return rrsParseCandles(await res.json());
+}
+
+async function ensureRiskRegimeTable(env) {
+  await env.DB.prepare(
+    'CREATE TABLE IF NOT EXISTS risk_regime_readings (ts INTEGER PRIMARY KEY, version TEXT NOT NULL, status TEXT NOT NULL, score REAL, regime TEXT, reading_json TEXT NOT NULL, generated_ts INTEGER NOT NULL)'
+  ).run();
+}
+
+// Scores the current hour (inputs: candles closed before the top of the hour)
+// and stores it once per hour: INSERT OR IGNORE on the hour key, so repeated
+// cron runs or concurrent page loads never create duplicates.
+async function computeRiskRegimeReading(env, now = Date.now()) {
+  const scoringTs = Math.floor(now / RRS_HOUR_MS) * RRS_HOUR_MS;
+  const feats = {};
+  await Promise.all(RRS_BASKET.map(async (b) => {
+    try { feats[b.symbol] = rrsInstrumentFeatures(await rrsFetchCandles(b.symbol, scoringTs), scoringTs); }
+    catch (e) { feats[b.symbol] = { status: 'ERROR', error: String(e.message || e).slice(0, 160) }; }
+  }));
+  const reading = { ...scoreRiskRegime(feats, scoringTs), generated_ts: now };
+  await ensureRiskRegimeTable(env);
+  await env.DB.prepare('INSERT OR IGNORE INTO risk_regime_readings (ts, version, status, score, regime, reading_json, generated_ts) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .bind(scoringTs, RRS_VERSION, reading.status, reading.status === 'OK' ? reading.score : null, reading.regime, JSON.stringify(reading), now).run();
+  await env.DB.prepare('DELETE FROM risk_regime_readings WHERE ts < ?').bind(now - RRS_RETENTION_MS).run();
+  return reading;
+}
+
+// GET /risk-regime: the stored reading for the current hour (scored and stored
+// first if this hour has none yet), plus optional recent history. A reading
+// older than 2h (e.g. collection failing) is STALE and carries no score.
+async function getRiskRegimeReading(env, now = Date.now(), historyHours = 0) {
+  await ensureRiskRegimeTable(env);
+  const hourTs = Math.floor(now / RRS_HOUR_MS) * RRS_HOUR_MS;
+  let row = await env.DB.prepare('SELECT ts, reading_json FROM risk_regime_readings ORDER BY ts DESC LIMIT 1').first();
+  let computeError = null;
+  if (!row || row.ts < hourTs) {
+    try { await computeRiskRegimeReading(env, now); } catch (e) { computeError = String(e.message || e).slice(0, 200); }
+    row = await env.DB.prepare('SELECT ts, reading_json FROM risk_regime_readings ORDER BY ts DESC LIMIT 1').first();
+  }
+  let out;
+  if (!row) out = { ok: true, source: 'riskregime', version: RRS_VERSION, status: 'NO_DATA', reason: computeError || 'No reading stored yet' };
+  else {
+    const reading = JSON.parse(row.reading_json);
+    out = now - row.ts > RRS_MAX_READING_AGE_MS
+      ? { ok: true, source: 'riskregime', version: reading.version, status: 'STALE', scoring_ts: row.ts, reason: `Latest reading is ${((now - row.ts) / RRS_HOUR_MS).toFixed(1)}h old (>2h)${computeError ? `; refresh failed: ${computeError}` : ''}` }
+      : { ok: true, ...reading };
+  }
+  if (historyHours > 0) {
+    const h = await env.DB.prepare('SELECT ts, status, score, regime FROM risk_regime_readings WHERE ts >= ? ORDER BY ts ASC')
+      .bind(hourTs - Math.min(historyHours, 24 * 14) * RRS_HOUR_MS).all();
+    out.history = (h && h.results) || [];
+  }
+  return out;
+}
+
 // ---------- V1 sentiment-weight adaptation (SHADOW MODE) ----------
 // Bounded, audited proposals for the V1 composite's source weights, based on
 // each source's measured INCREMENTAL value: the composite's directional hit
@@ -1009,12 +1213,12 @@ async function snapshotResearchSources(env, now = Date.now()) {
 // that arrived after it was made (out of sample) against the unchanged
 // default weights. The defaults below mirror CryptoPulse/index.html
 // COMPOSITE_SOURCES_DEFAULTS at the version named here.
-const SENTIMENT_DEFAULT_WEIGHTS_VERSION = '2026-10-11-hloi';
+const SENTIMENT_DEFAULT_WEIGHTS_VERSION = '2026-10-12-riskregime';
 const SENTIMENT_DEFAULT_WEIGHTS = {
   fng: [14, 1.0], funding: [15, 1.0], longshort: [10, 0.5], global: [6, 1.0], cryptonews: [15, 0.7], macrogeo: [8, 0.7],
   geopolitics: [10, 0.6], regulatory: [12, 0.6], sosovalue: [15, 0.7], onchain: [8, 0.5], oil: [6, 0.6], yield10y: [5, 0.6],
   usd: [8, 0.6], nasdaq: [6, 0.7], sp500: [6, 0.7], ninemag: [8, 0.6], foufi: [6, 0.4], etfflows: [10, 0.8],
-  hypefunding: [4, 0.4], gold: [5, 0.5], strc: [5, 0.35], hloi: [4, 0.3],
+  hypefunding: [4, 0.4], gold: [5, 0.5], strc: [5, 0.35], hloi: [4, 0.3], riskregime: [4, 0.3],
 };
 const WEIGHT_ADAPT_POLICY = {
   mode: 'shadow', minFactor: 0.5, maxFactor: 1.5, maxStepPct: 10, maxSharePct: 20,
@@ -1199,6 +1403,7 @@ export default {
     } else if (event.cron === '0 * * * *') {
       ctx.waitUntil(checkFoufiDigest(env));
       ctx.waitUntil(snapshotHyperliquidOi(env).catch(e => console.error('Hyperliquid OI snapshot failed:', e.message)));
+      ctx.waitUntil(computeRiskRegimeReading(env).catch(e => console.error('Risk Regime Shock reading failed:', e.message)));
       ctx.waitUntil(snapshotResearchSources(env).catch(e => console.error('Research source snapshots failed:', e.message)));
     } else {
       ctx.waitUntil(runTechnicalEvaluation(env));
@@ -1230,6 +1435,15 @@ export default {
     if (url.pathname === '/hl-oi' && request.method === 'GET') {
       try {
         return new Response(JSON.stringify(await getHlOiReading(env)), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: String(err) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+    // GET /risk-regime[?history=N] -- scored reading for the V1 composite's "riskregime" source (rrs-v1).
+    if (url.pathname === '/risk-regime' && request.method === 'GET') {
+      try {
+        const hist = Math.max(0, Math.min(336, parseInt(url.searchParams.get('history') || '0', 10) || 0));
+        return new Response(JSON.stringify(await getRiskRegimeReading(env, Date.now(), hist)), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
       } catch (err) {
         return new Response(JSON.stringify({ ok: false, error: String(err) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
