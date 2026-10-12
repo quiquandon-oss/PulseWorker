@@ -1,0 +1,23 @@
+name: Verify risk-regime (post-deploy)
+# Read-only check of the live worker after each successful "Deploy Worker" run: GET /risk-regime,
+# /weight-adaptation, /hl-oi and /history. Never POSTs; no secrets are used.
+on:
+  workflow_run:
+    workflows: ["Deploy Worker"]
+    types: [completed]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Wait for the new deployment to propagate
+        run: sleep 30
+      - name: Verify
+        run: node scripts/verify-risk-regime.mjs
