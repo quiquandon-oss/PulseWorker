@@ -1551,7 +1551,11 @@ async function handleHistoryPost(request, env, corsHeaders, now = Date.now()) {
         if (!appendOnly) await pruneHistory(env);
         return json({ ok: true, ts, provenance });
       } catch (e) {
-        provenance = { recorded: false, reason: 'provenance store unavailable: ' + String(e.message || e) };
+        const msg = String(e.message || e);
+        // Only a missing table (migration not applied) falls back to the legacy unkeyed write. Any other failure may
+        // be transient: answer 503 and write nothing, so the client's retry with the same key stays idempotent.
+        if (!/no such table/i.test(msg)) return json({ ok: false, error: 'history write failed, retry: ' + msg }, 503);
+        provenance = { recorded: false, reason: 'provenance store unavailable: ' + msg };
       }
     }
   }

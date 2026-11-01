@@ -15,7 +15,8 @@ const ROLLBACK = readFileSync(new URL('../db/rollback/0001_history_provenance.sq
 const HISTORY_DDL = `CREATE TABLE history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, score REAL NOT NULL,
   technical_score REAL, btc_price REAL, gold_regime TEXT, sources_json TEXT, regime_mag REAL, bottom_score REAL, global_mcap REAL)`;
 
-function d1(db) {
+function d1(db, { failBatch = null } = {}) {
+  let queue = Promise.resolve();
   const stmt = (sql, args = []) => ({
     bind: (...a) => stmt(sql, a),
     run: async () => { const r = db.prepare(sql).run(...args); return { meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } }; },
@@ -24,10 +25,12 @@ function d1(db) {
   });
   return {
     prepare: (sql) => stmt(sql),
-    batch: async (stmts) => {
+    // D1 runs each batch as one serialized transaction: no other statement interleaves with it.
+    batch: (stmts) => (queue = queue.then(async () => {
+      if (failBatch) throw new Error(failBatch);
       db.exec('BEGIN');
       try { const out = []; for (const s of stmts) out.push(await s.run()); db.exec('COMMIT'); return out; } catch (e) { db.exec('ROLLBACK'); throw e; }
-    },
+    })),
   };
 }
 
@@ -223,5 +226,53 @@ describe('append-only mode (HISTORY_APPEND_ONLY=1)', () => {
       body: JSON.stringify({ updates: [{ ts: 1000, patch: { fng: 1 } }] }) }), env);
     expect(r.status).toBe(409);
     expect(db.prepare('SELECT sources_json FROM history WHERE ts = 1000').get().sources_json).toBeNull();
+  });
+});
+
+describe('robustness and upgrade order', () => {
+  it('concurrent identical requests write exactly one history row and one provenance row', async () => {
+    const db = freshDb();
+    const env = { DB: d1(db), HISTORY_PROVENANCE: '1' };
+    const body = { score: 61, provenance: provenance(), idempotencyKey: 'cp:concurrent1' };
+    const res = await Promise.all(Array.from({ length: 8 }, () => post(env, body).then((r) => r.json())));
+    expect(rows(db, 'history')).toHaveLength(1);
+    expect(rows(db, 'history_provenance')).toHaveLength(1);
+    expect(res.filter((r) => r.duplicate).length).toBe(7);
+  });
+  it('an old frontend (no provenance, no key) still writes against an upgraded Worker', async () => {
+    const db = freshDb();
+    const j = await (await post({ DB: d1(db), HISTORY_PROVENANCE: '1', HISTORY_APPEND_ONLY: '1' },
+      { score: 52, technicalScore: 48, sources: { fng: 50 }, btcPrice: 70000 })).json();
+    expect(j).toMatchObject({ ok: true, provenance: { recorded: false, reason: 'no provenance sent' } });
+    expect(rows(db, 'history')).toHaveLength(1);
+  });
+  it('the exact payload shape built by CryptoPulse buildCompositeProvenance is accepted (when that checkout is present)', async () => {
+    let html; try { html = readFileSync(new URL('../../CryptoPulse/index.html', import.meta.url), 'utf8'); } catch { return; }
+    if (!html.includes('function buildCompositeProvenance(')) return;
+    const grab = (name) => { const i = html.indexOf(`function ${name}(`); let d = 0, j = html.indexOf('{', i);
+      for (; j < html.length; j++) { if (html[j] === '{') d++; else if (html[j] === '}' && --d === 0) break; } return html.slice(i, j + 1); };
+    const F = new Function(`const COMPOSITE_WEIGHTS_VERSION='v';const HISTORY_FORMULA_VERSION='v1-composite-1';${grab('sourceObservedAt')}\n${grab('buildCompositeProvenance')}\nreturn buildCompositeProvenance;`)();
+    const all = [{ id: 'fng', weight: 14, confidence: 1 }, { id: 'regulatory', weight: 6, confidence: 0.5 }, { id: 'oil', weight: 3, confidence: 1 }];
+    const active = [{ ...all[0], baseWeight: 14, value: { score: 70, ts: NOW - 1000 } }, { ...all[1], baseWeight: 6, weight: 9, value: { score: 20 } }];
+    const p = F(active, all, { oil: { message: 'HTTP 429' } }, NOW, []);
+    const db = freshDb();
+    const j = await (await post({ DB: d1(db), HISTORY_PROVENANCE: '1' }, { score: Math.round((70 * 14 + 20 * 4.5) / 18.5), provenance: p })).json();
+    expect(j.provenance).toMatchObject({ recorded: true, reproducible: true });
+    const pj = JSON.parse(rows(db, 'history_provenance')[0].provenance_json);
+    expect(pj.sources.find((s) => s.id === 'regulatory').boost).toBe(1.5);
+    expect(pj.missing).toEqual([{ id: 'oil', base_weight: 3, reason: 'HTTP 429' }]);
+  });
+});
+
+describe('failure semantics', () => {
+  it('a transient batch failure writes nothing and answers 503, so a retry with the same key stays idempotent', async () => {
+    const db = freshDb();
+    const r = await post({ DB: d1(db, { failBatch: 'D1_ERROR: database is locked' }), HISTORY_PROVENANCE: '1' },
+      { score: 61, provenance: provenance(), idempotencyKey: 'cp:transient1' });
+    expect(r.status).toBe(503);
+    expect(rows(db, 'history')).toHaveLength(0);
+    const ok = await (await post({ DB: d1(db), HISTORY_PROVENANCE: '1' }, { score: 61, provenance: provenance(), idempotencyKey: 'cp:transient1' })).json();
+    expect(ok.provenance.recorded).toBe(true);
+    expect(rows(db, 'history')).toHaveLength(1);
   });
 });
