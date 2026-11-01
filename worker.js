@@ -1581,6 +1581,344 @@ function provenanceInsertValues(key, r, prov, requestId) {
     r.weights_overridden, r.n_boosted, r.skip_reason, r.auth_state, requestId, JSON.stringify(prov)];
 }
 
+// ═══ Server-side V1 sentiment collection (scomp-v1, 2026-11-01) ═══
+// The V1 composite only existed while a browser had V1 open (PEV-1: 23 gaps > 4.8 h in 22 days). This collects
+// every source that the Worker can reach with its own permissions on the hourly cron, scores each one with a faithful
+// port of the browser's scorer, and stores per-source observations plus a composite with full provenance.
+// INERT until the owner sets SERVER_COMPOSITE = "1" and applies db/migrations/0002_server_composite.sql. It never
+// writes to `history`: feeding V2 from it is a separate decision.
+// Rules: a source that fails, times out or is stale is recorded with its reason and excluded (weight renormalised
+// over the sources that answered, exactly like the browser); it is never replaced by a neutral score. Observation
+// times are the publisher's when the API provides one, otherwise the fetch time, and the registry says which.
+const SERVER_COMPOSITE_VERSION = 'scomp-v1';
+const SCOMP_TIMEOUT_MS = 8000;
+const SCOMP_COMPLETENESS_FLOOR = 0.5;           // same disclosed floor as the browser; below it the reading is flagged
+const SCOMP_H = 3600000;
+// Registry: who owns each source, how it is reached, its cadence, timestamp semantics and limitations.
+const SCOMP_SOURCE_REGISTRY = {
+  fng:         { owner: 'alternative.me', endpoint: 'GET https://api.alternative.me/fng/?limit=1', cadence: 'daily', timestamp: 'publisher (data[0].timestamp)', auth: 'none', limits: 'public free API', maxAgeMs: 36 * SCOMP_H, status: 'implemented' },
+  funding:     { owner: 'Hyperliquid', endpoint: 'POST api.hyperliquid.xyz/info metaAndAssetCtxs', cadence: 'live', timestamp: 'fetch time (live snapshot)', auth: 'none', limits: 'public, weight-based rate limit', status: 'implemented' },
+  longshort:   { owner: 'Hyperliquid', endpoint: 'same call as funding (5-asset funding proxy)', cadence: 'live', timestamp: 'fetch time (live snapshot)', auth: 'none', limits: 'approximation, see V1 comment', status: 'implemented' },
+  hypefunding: { owner: 'Hyperliquid', endpoint: 'same call as funding', cadence: 'live', timestamp: 'fetch time (live snapshot)', auth: 'none', limits: '', status: 'implemented' },
+  oil:         { owner: 'Hyperliquid xyz dex', endpoint: 'POST api.hyperliquid.xyz/info metaAndAssetCtxs dex=xyz (xyz:BRENTOIL)', cadence: 'live', timestamp: 'fetch time; value is mark vs prevDayPx (24 h)', auth: 'none', limits: '', status: 'implemented' },
+  usd:         { owner: 'Hyperliquid xyz dex', endpoint: 'same call (xyz:EUR)', cadence: 'live', timestamp: 'fetch time; mark vs prevDayPx', auth: 'none', limits: '', status: 'implemented' },
+  gold:        { owner: 'Hyperliquid xyz dex', endpoint: 'same call (xyz:GOLD)', cadence: 'live', timestamp: 'fetch time; mark vs prevDayPx', auth: 'none', limits: 'competing-haven inversion needs nasdaq/sp500 this cycle; without them it is not inverted (same as the browser when FRED fails)', status: 'implemented' },
+  global:      { owner: 'CoinGecko', endpoint: 'GET api.coingecko.com/api/v3/global (keyless)', cadence: '~minutes', timestamp: 'publisher (data.updated_at)', auth: 'none (keyless public tier)', limits: 'public tier ~5-30 calls/min; hourly is far below', maxAgeMs: 2 * SCOMP_H, status: 'implemented' },
+  onchain:     { owner: 'mempool.space', endpoint: 'GET mempool.space/api/v1/difficulty-adjustment', cadence: 'per block', timestamp: 'fetch time', auth: 'none', limits: 'public API, fair use', status: 'implemented' },
+  cryptonews:  { owner: 'CoinTelegraph RSS', endpoint: 'https://cointelegraph.com/rss', cadence: 'continuous', timestamp: 'fetch time (latest 15 items)', auth: 'none', limits: 'RSS syndication feed', status: 'implemented' },
+  macrogeo:    { owner: 'Investing.com RSS', endpoint: 'https://www.investing.com/rss/news_14.rss', cadence: 'continuous', timestamp: 'fetch time', auth: 'none', limits: 'RSS feed; terms of use should be confirmed by the owner for automated polling', status: 'implemented' },
+  geopolitics: { owner: 'BBC World RSS', endpoint: 'https://feeds.bbci.co.uk/news/world/rss.xml', cadence: 'continuous', timestamp: 'fetch time', auth: 'none', limits: 'RSS syndication feed', status: 'implemented' },
+  regulatory:  { owner: 'CoinDesk + The Block RSS', endpoint: 'coindesk.com/arc/outboundfeeds/rss/, theblock.co/rss.xml', cadence: 'continuous', timestamp: 'fetch time', auth: 'none', limits: 'best-effort per feed', status: 'implemented' },
+  hloi:        { owner: 'this Worker (hl_oi_snapshots)', endpoint: 'internal getHlOiReading', cadence: 'hourly', timestamp: 'latest snapshot ts', auth: 'internal', limits: '', status: 'implemented' },
+  riskregime:  { owner: 'this Worker (risk_regime_readings)', endpoint: 'internal getRiskRegimeReading', cadence: 'hourly', timestamp: 'reading ts', auth: 'internal', limits: 'excluded unless status OK', status: 'implemented' },
+  foufi:       { owner: 'this Worker (foufi_digest)', endpoint: 'internal foufi_digest', cadence: '1-2/day', timestamp: 'publisher (published_ts)', auth: 'internal', limits: 'excluded when > 30 h old (browser rule)', maxAgeMs: 30 * SCOMP_H, status: 'implemented' },
+  yield10y:    { owner: 'FRED (St. Louis Fed)', endpoint: 'api.stlouisfed.org series DGS10', cadence: 'daily, published with lag', timestamp: 'observation date', auth: 'FRED_API_KEY secret', limits: 'free key, 120 req/min', status: 'requires_secret' },
+  nasdaq:      { owner: 'FRED', endpoint: 'series NASDAQCOM', cadence: 'daily, lagged', timestamp: 'observation date', auth: 'FRED_API_KEY secret', limits: '', status: 'requires_secret' },
+  sp500:       { owner: 'FRED', endpoint: 'series SP500', cadence: 'daily, lagged', timestamp: 'observation date', auth: 'FRED_API_KEY secret', limits: '', status: 'requires_secret' },
+  sosovalue:   { owner: 'SoSoValue', endpoint: 'openapi.sosovalue.com /openapi/v1/news', cadence: 'continuous', timestamp: 'fetch time', auth: 'SOSO_API_KEY secret', limits: 'account API key and its terms', status: 'requires_secret' },
+  etfflows:    { owner: 'SoSoValue', endpoint: 'SoSoValue ETF flow API (browser panel)', cadence: 'daily', timestamp: 'flow date', auth: 'SOSO_API_KEY secret', limits: 'not ported yet: depends on the browser ETF panel logic', status: 'not_ported' },
+  ninemag:     { owner: 'Yahoo Finance via /stock-proxy', endpoint: 'query1.finance.yahoo.com v8 chart', cadence: 'market hours', timestamp: 'quote time', auth: 'none', limits: 'unofficial Yahoo endpoint, fragile and terms unclear; not ported', status: 'not_ported' },
+  strc:        { owner: 'Yahoo Finance via /stock-proxy', endpoint: 'STRC quote', cadence: 'market hours', timestamp: 'quote time', auth: 'none', limits: 'same as ninemag; not ported', status: 'not_ported' },
+};
+
+const scompTo0100 = (sat) => Math.round((sat + 1) * 50);
+const scompSatur = (x, scale) => Math.tanh(x / scale);
+const SCOMP_HL_ASSETS = ['BTC', 'ETH', 'HYPE', 'SOL', 'LINK'];
+const SCOMP_HL_FUNDING_FLOOR_HOURLY = 0.0000125;
+// Port of the browser SENT_LEXICON (CryptoPulse index.html). A test asserts both copies stay identical.
+const SCOMP_SENT_LEXICON = {
+  surge: 2, rally: 2, soar: 2, bullish: 2, gain: 1, gains: 1, rise: 1, rises: 1, rising: 1,
+  jump: 1, jumps: 1, boost: 1, boosts: 1, record: 1, high: 1, highs: 1, growth: 1, grows: 1,
+  approval: 2, approve: 2, approves: 2, partnership: 1, adoption: 2, upgrade: 1, breakthrough: 2,
+  recovery: 1, recovers: 1, inflow: 1, inflows: 1, buy: 1, buying: 1, optimism: 2, stabilize: 1,
+  ease: 1, eases: 1, cut: 1, cuts: 1, 'rate cut': 2, stimulus: 1, expansion: 1, strong: 1, beat: 1,
+  crash: -2, plunge: -2, plunges: -2, bearish: -2, drop: -1, drops: -1, falls: -1, falling: -1,
+  decline: -1, declines: -1, slump: -2, 'sell-off': -2, selloff: -2, fear: -1, fears: -1, panic: -2,
+  ban: -2, bans: -2, banned: -2, hack: -2, hacked: -2, exploit: -2, lawsuit: -1, sue: -1, sues: -1,
+  sanction: -2, sanctions: -2, war: -2, conflict: -1, tension: -1, tensions: -1, attack: -2,
+  inflation: -1, recession: -2, default: -2, bankruptcy: -2, bankrupt: -2, liquidation: -1,
+  liquidations: -1, hike: -1, hikes: -1, 'rate hike': -2, crackdown: -2, investigation: -1, fraud: -2,
+  outflow: -1, outflows: -1, downturn: -1, volatility: -1, uncertainty: -1, risk: -1, risks: -1,
+  tariff: -1, tariffs: -1, 'trade war': -2, stagflation: -2, escalate: -1, escalation: -1,
+  blockade: -2, strikes: -1, hawkish: -1,
+  ceasefire: 2, 'de-escalate': 1, 'de-escalation': 1, 'peace treaty': 2, dovish: 1,
+};
+const SCOMP_WORD_KEYS = Object.keys(SCOMP_SENT_LEXICON).filter(k => /^[a-z0-9_]+$/.test(k));
+const SCOMP_PHRASE_RES = Object.keys(SCOMP_SENT_LEXICON).filter(k => !/^[a-z0-9_]+$/.test(k))
+  .map(k => [k, new RegExp('\\b' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b')]);
+
+// Same result as the browser's scoreHeadline (one \b-bounded regex per lexicon key), computed by tokenising on
+// non-word characters (the JS \b definition) so a cron run stays well inside the Workers CPU budget.
+function scompScoreHeadline(title) {
+  const t = String(title).toLowerCase();
+  const tokens = new Set(t.split(/[^a-z0-9_]+/));
+  let score = 0, hits = 0;
+  for (const w of SCOMP_WORD_KEYS) if (tokens.has(w)) { score += SCOMP_SENT_LEXICON[w]; hits++; }
+  for (const [k, re] of SCOMP_PHRASE_RES) if (re.test(t)) { score += SCOMP_SENT_LEXICON[k]; hits++; }
+  return { score, hits };
+}
+function scompScoreHeadlineBatch(titles) {
+  const scored = titles.map(scompScoreHeadline);
+  const hits = scored.reduce((s, x) => s + x.hits, 0);
+  const total = scored.reduce((s, x) => s + x.score, 0);
+  return scompTo0100(scompSatur(hits > 0 ? total / hits : 0, 1.5));
+}
+
+// Pure scorers: identical arithmetic to the browser src* functions (contract-tested against index.html).
+const scompScorers = {
+  funding: (assets) => {
+    const btc = assets.BTC, eth = assets.ETH;
+    if (!btc || !eth) throw new Error('BTC/ETH not found in Hyperliquid universe');
+    const r = ((parseFloat(btc.funding) - SCOMP_HL_FUNDING_FLOOR_HOURLY) * 8 + (parseFloat(eth.funding) - SCOMP_HL_FUNDING_FLOOR_HOURLY) * 8) / 2;
+    return scompTo0100(scompSatur(r * 100, 0.05));
+  },
+  longshort: (assets) => {
+    const rates = SCOMP_HL_ASSETS.map(s => assets[s] ? parseFloat(assets[s].funding) - SCOMP_HL_FUNDING_FLOOR_HOURLY : null).filter(v => v != null);
+    if (!rates.length) throw new Error('No Hyperliquid funding data for any tracked asset');
+    return scompTo0100(scompSatur((rates.reduce((a, b) => a + b, 0) / rates.length) * 8 * 100, 0.05));
+  },
+  hypefunding: (assets) => {
+    const c = assets.HYPE;
+    if (!c) throw new Error('HYPE not found in Hyperliquid universe');
+    return scompTo0100(scompSatur((parseFloat(c.funding) - SCOMP_HL_FUNDING_FLOOR_HOURLY) * 24 * 365 * 100, 50));
+  },
+  xyzPct: (xyz, name) => {
+    const c = xyz[name];
+    if (!c) throw new Error(name + ' not found on the xyz dex');
+    const mark = parseFloat(c.markPx), prev = parseFloat(c.prevDayPx);
+    if (!Number.isFinite(mark) || !Number.isFinite(prev) || prev === 0) throw new Error(name + ' has no usable markPx/prevDayPx');
+    return ((mark - prev) / prev) * 100;
+  },
+  oil: (xyz) => scompTo0100(scompSatur(-scompScorers.xyzPct(xyz, 'xyz:BRENTOIL'), 3)),
+  usd: (xyz) => scompTo0100(scompSatur(scompScorers.xyzPct(xyz, 'xyz:EUR'), 1.5)),
+  gold: (xyz, { btcChg = null, equitiesScore = null } = {}) => {
+    const pct = scompScorers.xyzPct(xyz, 'xyz:GOLD');
+    let invert = false;
+    if (btcChg != null && equitiesScore != null) {
+      const goldUp = pct > 0, btcUp = btcChg > 0, eqUp = equitiesScore > 50;
+      if (goldUp !== btcUp && eqUp === btcUp) invert = true;
+    }
+    return scompTo0100(scompSatur(invert ? -pct : pct, 2));
+  },
+  global: (json) => {
+    const change = json?.data?.market_cap_change_percentage_24h_usd;
+    if (typeof change !== 'number') throw new Error('CoinGecko global: no market_cap_change_percentage_24h_usd');
+    return scompTo0100(scompSatur(-change, 5));
+  },
+  onchain: (json) => {
+    if (typeof json?.difficultyChange !== 'number') throw new Error('mempool.space: no difficultyChange');
+    return scompTo0100(scompSatur(json.difficultyChange, 4));
+  },
+  fred: (obs, { scale, invert }) => {
+    if (!obs || obs.length < 2) throw new Error('Not enough FRED points');
+    const latest = parseFloat(obs[0].value), previous = parseFloat(obs[1].value);
+    if (!Number.isFinite(latest) || !Number.isFinite(previous) || previous === 0) throw new Error('FRED value not numeric');
+    const pct = ((latest - previous) / previous) * 100;
+    return scompTo0100(scompSatur(invert ? -pct : pct, scale));
+  },
+  foufi: (btcScore) => ((btcScore + 2) / 4) * 100,
+};
+const SCOMP_FRED = { yield10y: { series: 'DGS10', scale: 1.2, invert: true }, nasdaq: { series: 'NASDAQCOM', scale: 2, invert: false }, sp500: { series: 'SP500', scale: 2, invert: false } };
+const SCOMP_NEWS_FEEDS = {
+  cryptonews: [{ url: 'https://cointelegraph.com/rss', name: 'CoinTelegraph' }],
+  macrogeo: [{ url: 'https://www.investing.com/rss/news_14.rss', name: 'Investing.com Economy' }],
+  geopolitics: [{ url: 'https://feeds.bbci.co.uk/news/world/rss.xml', name: 'BBC World News' }],
+  regulatory: [{ url: 'https://www.coindesk.com/arc/outboundfeeds/rss/', name: 'CoinDesk' }, { url: 'https://www.theblock.co/rss.xml', name: 'The Block' }],
+};
+
+// fetch with a hard timeout and at most `retries` retries on network error, timeout, 429 or 5xx.
+async function scompFetch(url, init = {}, { timeoutMs = SCOMP_TIMEOUT_MS, retries = 1, sleep = (ms) => new Promise(r => setTimeout(r, ms)), fetchImpl = fetch } = {}) {
+  let lastErr = null, attempts = 0;
+  for (let i = 0; i <= retries; i++) {
+    attempts++;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const res = await fetchImpl(url, { ...init, signal: ctl.signal });
+      if (res.status === 429 || res.status >= 500) { lastErr = new Error(`HTTP ${res.status}`); lastErr.httpStatus = res.status; }
+      else if (!res.ok) { const e = new Error(`HTTP ${res.status}`); e.attempts = attempts; throw e; }
+      else { res.attempts = attempts; return res; }
+    } catch (e) {
+      if (e.attempts) throw e;                                  // non-retryable HTTP error
+      lastErr = e.name === 'AbortError' ? new Error(`timeout after ${timeoutMs} ms`) : e;
+    } finally { clearTimeout(timer); }
+    if (i < retries) await sleep(1000 * (i + 1));
+  }
+  lastErr.attempts = attempts;
+  throw lastErr;
+}
+
+// Collects every source once. Returns { slotTs, observations: [{ source_id, status, score, observed_at, fetched_at,
+// latency_ms, attempts, error }] }. Never throws for a source failure: it is recorded instead.
+async function collectServerSources(env, { now = Date.now(), fetchImpl = fetch, sleep } = {}) {
+  const slotTs = Math.floor(now / SCOMP_H) * SCOMP_H;
+  const opts = { fetchImpl, ...(sleep ? { sleep } : {}) };
+  const obs = {};
+  const record = (id, o) => { obs[id] = { source_id: id, status: 'ok', score: null, observed_at: null, fetched_at: now, latency_ms: null, attempts: null, error: null, ...o }; };
+  const run = async (ids, fn) => {
+    const t0 = Date.now();
+    try {
+      const out = await fn();
+      for (const id of ids) {
+        const r = out[id];
+        if (r instanceof Error) record(id, { status: 'error', error: r.message.slice(0, 300), latency_ms: Date.now() - t0, attempts: out.__attempts ?? null });
+        else record(id, { ...r, latency_ms: Date.now() - t0, attempts: out.__attempts ?? null });
+      }
+    } catch (e) {
+      for (const id of ids) record(id, { status: /timeout/.test(e.message) ? 'timeout' : 'error', error: String(e.message || e).slice(0, 300), latency_ms: Date.now() - t0, attempts: e.attempts ?? null });
+    }
+  };
+  const each = (ids, f) => { const o = {}; for (const id of ids) { try { o[id] = f(id); } catch (e) { o[id] = e; } } return o; };
+  const hlPost = (body) => scompFetch('https://api.hyperliquid.xyz/info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, opts);
+  let btcChg = null;
+
+  await Promise.all([
+    run(['funding', 'longshort', 'hypefunding'], async () => {
+      const res = await hlPost({ type: 'metaAndAssetCtxs' });
+      const [meta, ctxs] = await res.json();
+      const assets = {};
+      (meta?.universe || []).forEach((u, i) => { if (SCOMP_HL_ASSETS.includes(u.name)) assets[u.name] = ctxs[i]; });
+      const b = assets.BTC; if (b) { const m = parseFloat(b.markPx), p = parseFloat(b.prevDayPx); if (Number.isFinite(m) && p) btcChg = (m - p) / p * 100; }
+      return { ...each(['funding', 'longshort', 'hypefunding'], id => ({ score: scompScorers[id](assets), observed_at: now })), __attempts: res.attempts };
+    }),
+    run(['fng'], async () => {
+      const res = await scompFetch('https://api.alternative.me/fng/?limit=1', {}, opts);
+      const d = (await res.json())?.data?.[0];
+      const v = parseInt(d?.value, 10), ts = parseInt(d?.timestamp, 10) * 1000;
+      if (!Number.isFinite(v)) throw new Error('alternative.me: no value');
+      if (!Number.isFinite(ts)) return { fng: new Error('alternative.me: no publisher timestamp'), __attempts: res.attempts };
+      if (now - ts > SCOMP_SOURCE_REGISTRY.fng.maxAgeMs) return { fng: { status: 'stale', score: null, observed_at: ts, error: `published ${((now - ts) / SCOMP_H).toFixed(1)} h ago` }, __attempts: res.attempts };
+      return { fng: { score: v, observed_at: ts }, __attempts: res.attempts };
+    }),
+    run(['global'], async () => {
+      const res = await scompFetch('https://api.coingecko.com/api/v3/global', { headers: { accept: 'application/json' } }, opts);
+      const j = await res.json();
+      const ts = Number.isFinite(j?.data?.updated_at) ? j.data.updated_at * 1000 : null;
+      if (ts != null && now - ts > SCOMP_SOURCE_REGISTRY.global.maxAgeMs) return { global: { status: 'stale', observed_at: ts, error: 'CoinGecko global not updated for > 2 h' }, __attempts: res.attempts };
+      return { global: { score: scompScorers.global(j), observed_at: ts ?? now }, __attempts: res.attempts };
+    }),
+    run(['onchain'], async () => {
+      const res = await scompFetch('https://mempool.space/api/v1/difficulty-adjustment', {}, opts);
+      return { onchain: { score: scompScorers.onchain(await res.json()), observed_at: now }, __attempts: res.attempts };
+    }),
+    ...Object.entries(SCOMP_NEWS_FEEDS).map(([id, feeds]) => run([id], async () => {
+      const results = await Promise.allSettled(feeds.map(async f => parseRssTitles(await (await scompFetch(f.url, {}, opts)).text(), f.name)));
+      const per = results.map(r => r.status === 'fulfilled' ? r.value : []);
+      const merged = [];
+      for (let i = 0; i < Math.max(0, ...per.map(a => a.length)); i++) per.forEach(a => { if (a[i]) merged.push(a[i]); });
+      const titles = merged.slice(0, 15).map(a => a.title).filter(t => t && t.trim());
+      if (!titles.length) throw new Error('no headlines: ' + results.map(r => r.reason?.message).filter(Boolean).join('; '));
+      return { [id]: { score: scompScoreHeadlineBatch(titles), observed_at: now } };
+    })),
+    run(['hloi'], async () => {
+      const r = await getHlOiReading(env, now);
+      if (r.status !== 'OK' || !Number.isFinite(r.score)) return { hloi: { status: r.status === 'STALE' ? 'stale' : 'error', error: `${r.status}: ${r.reason || 'no score'}` } };
+      return { hloi: { score: r.score, observed_at: r.latest_ts ?? r.ts ?? now } };
+    }),
+    run(['riskregime'], async () => {
+      const r = await getRiskRegimeReading(env, now, 0);
+      if (r.status !== 'OK' || !Number.isFinite(r.score)) return { riskregime: { status: 'error', error: `${r.status}: ${r.reason || 'no score'}` } };
+      return { riskregime: { score: r.score, observed_at: r.ts ?? now } };
+    }),
+    run(['foufi'], async () => {
+      const { results } = await env.DB.prepare('SELECT published_ts, transcript_status, summary_json FROM foufi_digest ORDER BY published_ts DESC LIMIT 2').all();
+      for (const row of results || []) {
+        let s = null; try { s = JSON.parse(row.summary_json || 'null'); } catch { s = null; }
+        if (row.transcript_status === 'ok' && s?.coins?.BTC?.score != null) {
+          if (now - row.published_ts > SCOMP_SOURCE_REGISTRY.foufi.maxAgeMs) return { foufi: { status: 'stale', observed_at: row.published_ts, error: 'latest usable digest > 30 h old' } };
+          return { foufi: { score: scompScorers.foufi(s.coins.BTC.score), observed_at: row.published_ts } };
+        }
+      }
+      return { foufi: new Error('no usable Foufi digest') };
+    }),
+    ...Object.entries(SCOMP_FRED).map(([id, cfg]) => run([id], async () => {
+      if (!env.FRED_API_KEY) return { [id]: { status: 'unavailable', error: 'requires FRED_API_KEY secret on the Worker' } };
+      const u = `https://api.stlouisfed.org/fred/series/observations?series_id=${cfg.series}&api_key=${encodeURIComponent(env.FRED_API_KEY)}&file_type=json&sort_order=desc&limit=5`;
+      const res = await scompFetch(u, { cf: { cacheTtl: 0, cacheEverything: false } }, opts);
+      const o = (await res.json())?.observations?.filter(x => x.value !== '.');
+      const date = o?.[0]?.date ? Date.parse(o[0].date + 'T00:00:00Z') : null;
+      return { [id]: { score: scompScorers.fred(o, cfg), observed_at: Number.isFinite(date) ? date : null }, __attempts: res.attempts };
+    })),
+    run(['sosovalue'], async () => {
+      if (!env.SOSO_API_KEY) return { sosovalue: { status: 'unavailable', error: 'requires SOSO_API_KEY secret on the Worker' } };
+      const res = await scompFetch('https://openapi.sosovalue.com/openapi/v1/news?page_num=1&page_size=15&category_list=1,2,3,4,7,13', { headers: { 'x-soso-api-key': env.SOSO_API_KEY } }, opts);
+      const titles = ((await res.json())?.data?.list || []).slice(0, 15).map(a => a.title || '').filter(t => t.trim());
+      if (!titles.length) throw new Error('SoSoValue: no usable titles');
+      return { sosovalue: { score: scompScoreHeadlineBatch(titles), observed_at: now }, __attempts: res.attempts };
+    }),
+  ]);
+  // Gold last: its competing-haven test needs this cycle's equities scores, exactly like the browser.
+  await run(['gold', 'oil', 'usd'], async () => {
+    const res = await hlPost({ type: 'metaAndAssetCtxs', dex: 'xyz' });
+    const [meta, ctxs] = await res.json();
+    const xyz = {}; (meta?.universe || []).forEach((u, i) => { xyz[u.name] = ctxs[i]; });
+    const eq = ['nasdaq', 'sp500'].map(k => obs[k]?.status === 'ok' ? obs[k].score : null).filter(v => v != null);
+    const equitiesScore = eq.length ? eq.reduce((a, b) => a + b, 0) / eq.length : null;
+    return { ...each(['gold', 'oil', 'usd'], id => ({ score: id === 'gold' ? scompScorers.gold(xyz, { btcChg, equitiesScore }) : scompScorers[id](xyz), observed_at: now })), __attempts: res.attempts };
+  });
+  for (const [id, reg] of Object.entries(SCOMP_SOURCE_REGISTRY)) {
+    if (reg.status === 'not_ported') record(id, { status: 'unavailable', error: 'not collected server-side: ' + reg.limits });
+  }
+  for (const o of Object.values(obs)) if (o.status === 'ok' && !(Number.isFinite(o.score) && o.score >= 0 && o.score <= 100)) { o.status = 'error'; o.error = 'score outside 0-100'; o.score = null; }
+  return { slotTs, observations: SCOMP_ORDER.map(id => obs[id]) };
+}
+const SCOMP_ORDER = Object.keys(SCOMP_SOURCE_REGISTRY);
+
+// Composite from the collected observations with the V1 default weights (SENTIMENT_DEFAULT_WEIGHTS) and the browser's
+// arithmetic; provenance in the v1-composite-1 shape so the same validator and recomputation apply.
+function buildServerComposite(collected, weights = SENTIMENT_DEFAULT_WEIGHTS, now = Date.now()) {
+  const ok = collected.observations.filter(o => o.status === 'ok' && weights[o.source_id]);
+  const sources = ok.map(o => ({ id: o.source_id, score: o.score, base_weight: weights[o.source_id][0], confidence: weights[o.source_id][1], boost: 1, observed_at: o.observed_at }));
+  const missing = collected.observations.filter(o => o.status !== 'ok' && weights[o.source_id]).map(o => ({ id: o.source_id, base_weight: weights[o.source_id][0], reason: `${o.status}: ${o.error || ''}`.slice(0, 200) }));
+  const totalPossible = Object.values(weights).reduce((a, w) => a + w[0], 0) || 1;
+  const completeness = sources.reduce((a, s) => a + s.base_weight, 0) / totalPossible;
+  const exact = recomputeComposite(sources);
+  return {
+    slot_ts: collected.slotTs, computed_ts: now, version: SERVER_COMPOSITE_VERSION, weights_version: SENTIMENT_DEFAULT_WEIGHTS_VERSION,
+    composite: exact == null ? null : Math.round(exact), composite_exact: exact, completeness,
+    below_floor: completeness < SCOMP_COMPLETENESS_FLOOR ? 1 : 0, n_ok: sources.length, n_missing: missing.length,
+    provenance: { formula_version: V1_COMPOSITE_FORMULA, computed_at: now, weights_version: SENTIMENT_DEFAULT_WEIGHTS_VERSION,
+      weights_overridden: [], completeness, sources, missing, boost_applied: false, collector: SERVER_COMPOSITE_VERSION },
+  };
+}
+
+// One hourly run. Idempotent per hour slot: a re-run of the same slot writes nothing (INSERT OR IGNORE on keys).
+async function runServerComposite(env, { now = Date.now(), fetchImpl = fetch, sleep } = {}) {
+  const collected = await collectServerSources(env, { now, fetchImpl, sleep });
+  const c = buildServerComposite(collected, SENTIMENT_DEFAULT_WEIGHTS, now);
+  const stmts = collected.observations.map(o => env.DB.prepare(
+    `INSERT OR IGNORE INTO server_source_observations (slot_ts, source_id, status, score, observed_at, fetched_at, latency_ms, attempts, error, collector_version)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(collected.slotTs, o.source_id, o.status, o.score, o.observed_at, o.fetched_at, o.latency_ms, o.attempts, o.error, SERVER_COMPOSITE_VERSION));
+  stmts.push(env.DB.prepare(
+    `INSERT OR IGNORE INTO server_composite_readings (slot_ts, computed_ts, version, weights_version, composite, composite_exact, completeness, below_floor, n_ok, n_missing, provenance_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(c.slot_ts, c.computed_ts, c.version, c.weights_version, c.composite, c.composite_exact, c.completeness, c.below_floor, c.n_ok, c.n_missing, JSON.stringify(c.provenance)));
+  const res = await env.DB.batch(stmts);
+  return { ok: true, slot_ts: c.slot_ts, composite: c.composite, completeness: c.completeness, below_floor: !!c.below_floor,
+    n_ok: c.n_ok, n_missing: c.n_missing, duplicate: (res.at(-1)?.meta?.changes ?? 1) === 0 };
+}
+
+// Read-only coverage, freshness and completeness monitor over the last `hours`.
+async function getServerCompositeStatus(env, now = Date.now(), hours = 168) {
+  const since = now - hours * SCOMP_H;
+  const expectedSlots = Math.floor(now / SCOMP_H) - Math.floor(since / SCOMP_H);
+  try {
+    const { results: per } = await env.DB.prepare(
+      `SELECT source_id, COUNT(*) AS n, SUM(status = 'ok') AS n_ok, MAX(CASE WHEN status = 'ok' THEN observed_at END) AS last_ok_observed_at,
+              MAX(CASE WHEN status = 'ok' THEN slot_ts END) AS last_ok_slot, AVG(CASE WHEN status = 'ok' THEN fetched_at - observed_at END) AS mean_age_ms
+       FROM server_source_observations WHERE slot_ts >= ? GROUP BY source_id`).bind(since).all();
+    const { results: comp } = await env.DB.prepare(
+      'SELECT COUNT(*) AS n, SUM(below_floor) AS n_below_floor, AVG(completeness) AS mean_completeness, MIN(completeness) AS min_completeness, MAX(slot_ts) AS last_slot FROM server_composite_readings WHERE slot_ts >= ?').bind(since).all();
+    const bySource = Object.fromEntries((per || []).map(r => [r.source_id, r]));
+    return { ok: true, enabled: env.SERVER_COMPOSITE === '1', version: SERVER_COMPOSITE_VERSION, window_hours: hours, expected_slots: expectedSlots,
+      readings: comp?.[0] || null,
+      sources: SCOMP_ORDER.map(id => ({ id, registry: SCOMP_SOURCE_REGISTRY[id], n: bySource[id]?.n ?? 0, n_ok: bySource[id]?.n_ok ?? 0,
+        coverage: expectedSlots ? (bySource[id]?.n_ok ?? 0) / expectedSlots : null, last_ok_observed_at: bySource[id]?.last_ok_observed_at ?? null,
+        mean_age_ms: bySource[id]?.mean_age_ms ?? null })) };
+  } catch (e) {
+    return { ok: false, enabled: env.SERVER_COMPOSITE === '1', version: SERVER_COMPOSITE_VERSION, error: /no such table/i.test(String(e.message)) ? 'tables not created: apply db/migrations/0002_server_composite.sql' : String(e.message || e) };
+  }
+}
+
 export default {
   async scheduled(event, env, ctx) {
     // Three crons share this handler now (see wrangler.toml): "0 6,18 * * *"
@@ -1600,6 +1938,8 @@ export default {
       ctx.waitUntil(snapshotHyperliquidOi(env).catch(e => console.error('Hyperliquid OI snapshot failed:', e.message)));
       ctx.waitUntil(computeRiskRegimeReading(env).catch(e => console.error('Risk Regime Shock reading failed:', e.message)));
       ctx.waitUntil(snapshotResearchSources(env).catch(e => console.error('Research source snapshots failed:', e.message)));
+      // Server-side V1 composite (scomp-v1): inert unless the owner sets SERVER_COMPOSITE = "1".
+      if (env.SERVER_COMPOSITE === '1') ctx.waitUntil(runServerComposite(env).catch(e => console.error('Server composite failed:', e.message)));
     } else {
       ctx.waitUntil(runTechnicalEvaluation(env));
       // Once a day (06:00 tick of "0 6,18 * * *"): shadow weight proposal.
@@ -1624,6 +1964,12 @@ export default {
       } catch (err) {
         return new Response(JSON.stringify({ ok: false, error: String(err) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
+    }
+
+    // GET /server-composite/status -- read-only coverage/freshness/completeness of the server-side collector.
+    if (url.pathname === '/server-composite/status' && request.method === 'GET') {
+      const hours = Math.min(24 * 90, Math.max(1, parseInt(url.searchParams.get('hours') || '168', 10) || 168));
+      return new Response(JSON.stringify(await getServerCompositeStatus(env, Date.now(), hours)), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
     }
 
     // GET /hl-oi -- read-only scored reading for the V1 composite's "hloi" source.
