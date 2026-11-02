@@ -71,9 +71,8 @@
 1. **Migration:**
    `wrangler d1 execute sentiment-history --remote --file db/migrations/0002_server_composite.sql`. It is additive and
    independent of 0001.
-2. **Optional secrets:**
-   - Use **new** keys; the current FRED and SoSoValue keys are embedded in the public V1 page and should be rotated.
-   - Set them with `wrangler secret put FRED_API_KEY` and `wrangler secret put SOSO_API_KEY`.
+2. **Optional secrets.** `FRED_API_KEY` and `SOSO_API_KEY` add yield10y, nasdaq, sp500 and sosovalue (17% of base
+   weight). Without them those sources are recorded as `unavailable` with that reason.
 3. **Switch on:** set the variable `SERVER_COMPOSITE = "1"`. The next `0 * * * *` tick collects.
 4. **Check after 24 h:** `GET /server-composite/status?hours=24`. Coverage should be at least 0.9 for the public
    sources; any source with low coverage has its error recorded.
