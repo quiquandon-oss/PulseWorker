@@ -1386,6 +1386,201 @@ async function getWeightAdaptation(env, now = Date.now()) {
     history: history.map(({ evidence, prev_weights, ...h }) => h), generated_ts: now };
 }
 
+// ═══ Sentiment history: provenance, write auth, append-only (2026-11-01) ═══
+// Everything here is inert until the owner configures it, so deploying this code changes nothing on its own:
+//   HISTORY_WRITE_TOKEN (secret)  -> POST /history and POST /backfill-sources require X-History-Token.
+//                                    Not X-App-Secret: that value is embedded in the public V1 page.
+//   HISTORY_PROVENANCE = "1" (var) -> each composite's inputs are recorded in history_provenance (append-only by
+//                                    triggers; created only by migrations/0001_history_provenance.sql).
+//   HISTORY_APPEND_ONLY = "1" (var)-> no pruning of history to 500 rows, and /backfill-sources is refused.
+// A provenance failure never blocks the history write itself; it is reported in the response.
+const V1_COMPOSITE_FORMULA = 'v1-composite-1';   // sum(score * w) / sum(w), w = base_weight * boost * confidence
+const PROVENANCE_ID_RE = /^[a-z0-9_]{1,32}$/;
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9:_-]{8,128}$/;
+const PROVENANCE_SKIP_REASONS = new Set(['low_completeness']);
+
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return diff === 0;
+}
+
+// 'token' (valid token), 'open' (no token configured: legacy behaviour), or 'rejected'.
+function historyWriteAuth(request, env) {
+  if (!env.HISTORY_WRITE_TOKEN) return 'open';
+  return timingSafeEqualStr(request.headers.get('X-History-Token') || '', env.HISTORY_WRITE_TOKEN) ? 'token' : 'rejected';
+}
+
+const finiteIn = (v, lo, hi) => typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi;
+
+// Validates and normalises the client's provenance. Returns { ok: true, value } or { ok: false, error }.
+function normalizeProvenance(p) {
+  if (!p || typeof p !== 'object') return { ok: false, error: 'provenance object required' };
+  if (p.formula_version !== V1_COMPOSITE_FORMULA) return { ok: false, error: `formula_version must be ${V1_COMPOSITE_FORMULA}` };
+  if (!finiteIn(p.computed_at, 1e12, 1e13)) return { ok: false, error: 'computed_at (epoch ms) required' };
+  if (!Array.isArray(p.sources) || p.sources.length > 64) return { ok: false, error: 'sources[] (max 64) required' };
+  const missing = Array.isArray(p.missing) ? p.missing : [];
+  if (missing.length > 64) return { ok: false, error: 'missing[] max 64' };
+  const seen = new Set();
+  const sources = [];
+  for (const s of p.sources) {
+    if (!s || !PROVENANCE_ID_RE.test(s.id) || seen.has(s.id)) return { ok: false, error: 'source id invalid or duplicated' };
+    if (!finiteIn(s.score, 0, 100) || !finiteIn(s.base_weight, 0, 1000) || !finiteIn(s.confidence, 0, 1) || !finiteIn(s.boost ?? 1, 0, 10)) {
+      return { ok: false, error: `source ${s.id}: score 0-100, base_weight 0-1000, confidence 0-1, boost 0-10 required` };
+    }
+    if (s.observed_at != null && !finiteIn(s.observed_at, 1e12, 1e13)) return { ok: false, error: `source ${s.id}: observed_at must be epoch ms or null` };
+    seen.add(s.id);
+    sources.push({ id: s.id, score: s.score, base_weight: s.base_weight, confidence: s.confidence, boost: s.boost ?? 1,
+      observed_at: s.observed_at ?? null });
+  }
+  const miss = [];
+  for (const m of missing) {
+    if (!m || !PROVENANCE_ID_RE.test(m.id) || seen.has(m.id)) return { ok: false, error: 'missing id invalid or also listed as a source' };
+    seen.add(m.id);
+    miss.push({ id: m.id, base_weight: finiteIn(m.base_weight, 0, 1000) ? m.base_weight : null,
+      reason: typeof m.reason === 'string' && m.reason ? m.reason.slice(0, 200) : 'unspecified' });
+  }
+  const total = sources.reduce((a, s) => a + s.base_weight * s.boost * s.confidence, 0);
+  for (const s of sources) s.effective_weight_pct = total > 0 ? Math.round(s.base_weight * s.boost * s.confidence / total * 1e6) / 1e4 : null;
+  return { ok: true, value: {
+    formula_version: V1_COMPOSITE_FORMULA, computed_at: p.computed_at,
+    weights_version: typeof p.weights_version === 'string' ? p.weights_version.slice(0, 64) : null,
+    weights_overridden: Array.isArray(p.weights_overridden) ? p.weights_overridden.filter(id => PROVENANCE_ID_RE.test(id)).slice(0, 64) : [],
+    completeness: finiteIn(p.completeness, 0, 1) ? p.completeness : null,
+    sources, missing: miss,
+  } };
+}
+
+// Server-side recomputation of the composite from the recorded inputs (formula v1-composite-1).
+function recomputeComposite(sources) {
+  let num = 0, den = 0;
+  for (const s of sources) { const w = s.base_weight * s.boost * s.confidence; num += s.score * w; den += w; }
+  return den > 0 ? num / den : null;
+}
+
+// Stable JSON (sorted keys) so identical content always gives the same idempotency hash.
+function canonicalJson(v) {
+  if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canonicalJson(v[k])).join(',') + '}';
+  return JSON.stringify(v ?? null);
+}
+
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function provenanceRecord(prov, clientScore, now, authState, historyTs, skipReason) {
+  const server = recomputeComposite(prov.sources);
+  const ages = prov.sources.filter(s => s.observed_at != null).map(s => prov.computed_at - s.observed_at);
+  return {
+    history_ts: historyTs, received_ts: now, client_computed_ts: prov.computed_at, formula_version: prov.formula_version,
+    client_score: clientScore, server_score: server == null ? null : Math.round(server * 1e4) / 1e4,
+    // the client rounds the composite to an integer, so it is reproducible when the exact value rounds to it
+    reproducible: server != null && clientScore != null && Math.abs(server - clientScore) <= 0.5 + 1e-9 ? 1 : 0,
+    completeness: prov.completeness, n_active: prov.sources.length, n_missing: prov.missing.length,
+    n_freshness_known: ages.length, max_source_age_ms: ages.length ? Math.max(...ages) : null,
+    weights_version: prov.weights_version, weights_overridden: prov.weights_overridden.length ? 1 : 0,
+    n_boosted: prov.sources.filter(s => s.boost !== 1).length, skip_reason: skipReason, auth_state: authState,
+  };
+}
+
+const HISTORY_INSERT_COLS = 'ts, score, technical_score, btc_price, gold_regime, sources_json, regime_mag, bottom_score, global_mcap';
+
+function historyInsertValues(body, now) {
+  const { score, technicalScore, btcPrice, sources, goldRegime, regimeMag, bottomScore, globalMcap } = body;
+  return [now, score, typeof technicalScore === 'number' ? technicalScore : null, btcPrice ?? null, goldRegime ?? null,
+    sources ? JSON.stringify(sources) : null, typeof regimeMag === 'number' ? regimeMag : null,
+    typeof bottomScore === 'number' ? bottomScore : null, typeof globalMcap === 'number' ? globalMcap : null];
+}
+
+// POST /history. Without HISTORY_PROVENANCE the history write is exactly the legacy one.
+async function handleHistoryPost(request, env, corsHeaders, now = Date.now()) {
+  const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  const auth = historyWriteAuth(request, env);
+  if (auth === 'rejected') return json({ error: 'unauthorized' }, 401);
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'invalid JSON' }, 400); }
+  const provenanceOn = env.HISTORY_PROVENANCE === '1';
+  const appendOnly = env.HISTORY_APPEND_ONLY === '1';
+
+  // A reading the client computed but did not store (e.g. under the completeness floor): provenance only.
+  if (body && body.provenanceOnly) {
+    if (!PROVENANCE_SKIP_REASONS.has(body.skipReason)) return json({ error: 'skipReason must be one of ' + [...PROVENANCE_SKIP_REASONS].join(', ') }, 400);
+    if (!provenanceOn) return json({ ok: true, recorded: false, reason: 'provenance disabled' });
+    const n = normalizeProvenance(body.provenance);
+    if (!n.ok) return json({ error: 'provenance: ' + n.error }, 400);
+    const score = finiteIn(body.score, 0, 100) ? body.score : null;
+    const key = IDEMPOTENCY_KEY_RE.test(body.idempotencyKey || '') ? body.idempotencyKey : 'h:' + await sha256Hex(canonicalJson({ score, skip: body.skipReason, p: n.value }));
+    const rec = provenanceRecord(n.value, score, now, auth, null, body.skipReason);
+    try {
+      const r = await env.DB.prepare(provenanceInsertSql()).bind(...provenanceInsertValues(key, rec, n.value, crypto.randomUUID())).run();
+      return json({ ok: true, recorded: true, duplicate: (r.meta?.changes ?? 1) === 0, idempotency_key: key });
+    } catch (e) {
+      return json({ ok: false, recorded: false, error: 'provenance store unavailable: ' + String(e.message || e) }, 503);
+    }
+  }
+
+  const { score } = body || {};
+  if (typeof score !== 'number' || !Number.isFinite(score)) return json({ error: 'score (number) requis' }, 400);
+
+  let provenance = { recorded: false, reason: provenanceOn ? 'no provenance sent' : 'provenance disabled' };
+  let ts = now;
+  if (provenanceOn && body.provenance !== undefined) {
+    const n = normalizeProvenance(body.provenance);
+    if (!n.ok) {
+      provenance = { recorded: false, reason: 'invalid provenance: ' + n.error };
+    } else {
+      const key = IDEMPOTENCY_KEY_RE.test(body.idempotencyKey || '') ? body.idempotencyKey : 'h:' + await sha256Hex(canonicalJson({ score, p: n.value }));
+      const rec = provenanceRecord(n.value, score, now, auth, now, null);
+      const requestId = crypto.randomUUID();
+      try {
+        // One transaction: the provenance row claims the idempotency key; the history row is inserted only if this
+        // request's own provenance row (matched by its random request_id) holds the key. A retry writes neither.
+        const [p] = await env.DB.batch([
+          env.DB.prepare(provenanceInsertSql()).bind(...provenanceInsertValues(key, rec, n.value, requestId)),
+          env.DB.prepare(`INSERT INTO history (${HISTORY_INSERT_COLS}) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM history_provenance WHERE idempotency_key = ? AND request_id = ?)`)
+            .bind(...historyInsertValues(body, now), key, requestId),
+        ]);
+        if ((p.meta?.changes ?? 1) === 0) {
+          const prev = await env.DB.prepare('SELECT history_ts FROM history_provenance WHERE idempotency_key = ?').bind(key).first();
+          return json({ ok: true, duplicate: true, ts: prev ? prev.history_ts : null, idempotency_key: key });
+        }
+        provenance = { recorded: true, idempotency_key: key, reproducible: rec.reproducible === 1, server_score: rec.server_score };
+        if (!appendOnly) await pruneHistory(env);
+        return json({ ok: true, ts, provenance });
+      } catch (e) {
+        const msg = String(e.message || e);
+        // Only a missing table (migration not applied) falls back to the legacy unkeyed write. Any other failure may
+        // be transient: answer 503 and write nothing, so the client's retry with the same key stays idempotent.
+        if (!/no such table/i.test(msg)) return json({ ok: false, error: 'history write failed, retry: ' + msg }, 503);
+        provenance = { recorded: false, reason: 'provenance store unavailable: ' + msg };
+      }
+    }
+  }
+  await env.DB.prepare(`INSERT INTO history (${HISTORY_INSERT_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(...historyInsertValues(body, now)).run();
+  if (!appendOnly) await pruneHistory(env);
+  return json({ ok: true, ts, provenance });
+}
+
+async function pruneHistory(env) {
+  await env.DB.prepare('DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY ts DESC LIMIT 500)').run();
+}
+
+function provenanceInsertSql() {
+  return `INSERT OR IGNORE INTO history_provenance (idempotency_key, history_ts, received_ts, client_computed_ts, formula_version,
+    client_score, server_score, reproducible, completeness, n_active, n_missing, n_freshness_known, max_source_age_ms,
+    weights_version, weights_overridden, n_boosted, skip_reason, auth_state, request_id, provenance_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+}
+
+function provenanceInsertValues(key, r, prov, requestId) {
+  return [key, r.history_ts, r.received_ts, r.client_computed_ts, r.formula_version, r.client_score, r.server_score,
+    r.reproducible, r.completeness, r.n_active, r.n_missing, r.n_freshness_known, r.max_source_age_ms, r.weights_version,
+    r.weights_overridden, r.n_boosted, r.skip_reason, r.auth_state, requestId, JSON.stringify(prov)];
+}
+
 export default {
   async scheduled(event, env, ctx) {
     // Three crons share this handler now (see wrangler.toml): "0 6,18 * * *"
@@ -1419,7 +1614,7 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-App-Secret',
+      'Access-Control-Allow-Headers': 'Content-Type, X-App-Secret, X-History-Token',
     };
 
     // GET /weight-adaptation -- read-only: shadow weight proposals, evidence, out-of-sample check.
@@ -2131,35 +2326,11 @@ RULES:
       }
     }
 
-    // ---- POST /history — log one snapshot point (sentiment, technical, price, sources) ----
+    // ---- POST /history — log one snapshot point (sentiment, technical, price, sources). See handleHistoryPost:
+    // optional write token, optional provenance, optional append-only; legacy behaviour when none is configured. ----
     if (url.pathname === '/history' && request.method === 'POST') {
       try {
-        // FIX: regimeMag was already being sent by the client every cycle (see
-        // window.__lastRegimeScorecard?.overallMag in the POST body) but this
-        // handler never destructured or stored it — no regime_mag column
-        // existed either. Every read of row.regimeMag downstream (the
-        // self-backtest, the conviction-average-over-window helper) has
-        // therefore always seen null/undefined, silently. bottomScore is new:
-        // needed so the Market Bottom Signal can appear in the Dashboard's
-        // 24h-ago comparison alongside Sentiment/Technical/Combined/Scorecard.
-        // globalMcap: the raw total crypto market cap in USD (from CoinGecko's
-        // free /global endpoint, which the composite already calls every
-        // cycle for its 24h-change score — this is the SAME call, just also
-        // keeping the absolute dollar figure it was discarding before).
-        // History starts accumulating from whenever this first gets written —
-        // CoinGecko's actual historical total-market-cap chart endpoint is
-        // Pro-API-only, so there's no way to backfill real data before today.
-        const { score, technicalScore, btcPrice, sources, goldRegime, regimeMag, bottomScore, globalMcap } = await request.json();
-        if (typeof score !== 'number') {
-          return new Response(JSON.stringify({ error: 'score (number) requis' }), { status: 400, headers: corsHeaders });
-        }
-        const now = Date.now();
-        await env.DB.prepare('INSERT INTO history (ts, score, technical_score, btc_price, gold_regime, sources_json, regime_mag, bottom_score, global_mcap) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .bind(now, score, typeof technicalScore === 'number' ? technicalScore : null, btcPrice ?? null, goldRegime ?? null, sources ? JSON.stringify(sources) : null, typeof regimeMag === 'number' ? regimeMag : null, typeof bottomScore === 'number' ? bottomScore : null, typeof globalMcap === 'number' ? globalMcap : null).run();
-        await env.DB.prepare(
-          'DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY ts DESC LIMIT 500)'
-        ).run();
-        return new Response(JSON.stringify({ ok: true, ts: now }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return await handleHistoryPost(request, env, corsHeaders);
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
       }
@@ -2173,6 +2344,13 @@ RULES:
     // named keys are touched; everything else in that row's sources_json (and
     // the row's own score/technical_score/btc_price) is left exactly as-is. ----
     if (url.pathname === '/backfill-sources' && request.method === 'POST') {
+      // It rewrites stored rows, so it is subject to the history write token and refused once history is append-only.
+      if (historyWriteAuth(request, env) === 'rejected') {
+        return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      if (env.HISTORY_APPEND_ONLY === '1') {
+        return new Response(JSON.stringify({ error: 'history is append-only: backfill-sources is disabled' }), { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
       try {
         const { updates } = await request.json();
         if (!Array.isArray(updates)) {
