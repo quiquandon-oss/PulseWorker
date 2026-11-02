@@ -50,9 +50,9 @@ curl -s "https://sentiment-ff75.quiquandon.workers.dev/server-composite/status?h
 
 **Per source:**
 - `coverage` is the share of expected hourly slots with an ok reading.
-- This is the first evidence of which sources Cloudflare actually reaches.
-- From this sandbox only Hyperliquid has been demonstrated; alternative.me, CoinGecko, mempool.space and the RSS
-  feeds are blocked here by the network policy.
+- **Expected to work, with indirect production evidence:** Hyperliquid, the RSS feeds and Yahoo. See the table in
+  `SERVER_COMPOSITE.md`.
+- **First real evidence, either way:** alternative.me (`fng`), CoinGecko (`global`) and mempool.space (`onchain`).
 
 **Sources without credentials:** yield10y, nasdaq, sp500 and sosovalue show `unavailable` with the reason "requires
 …_API_KEY secret" unless those secrets exist.

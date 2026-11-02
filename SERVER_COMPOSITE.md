@@ -12,19 +12,28 @@
 
 ## Source registry (`SCOMP_SOURCE_REGISTRY` in `worker.js`)
 
-| Source | Weight | Collected by the Worker | Notes |
+| Source | Weight | Collected by the Worker | Reachability from Cloudflare |
 |---|---|---|---|
-| fng, funding, longshort, hypefunding, oil, usd, gold, global, onchain | 14, 15, 10, 4, 6, 8, 5, 6, 8 | **yes** (public APIs) | `fng` and `global` carry the publisher's timestamp and are marked stale past 36 h and 2 h respectively. The others are live snapshots stamped at fetch time. |
-| cryptonews, macrogeo, geopolitics, regulatory | 15, 8, 10, 12 | **yes** (RSS, the same feeds `/news-proxy` already fetches) | Investing.com's terms for automated RSS polling should be confirmed by the owner. |
-| hloi, riskregime, foufi | 4, 4, 6 | **yes** (this Worker's own tables) | Excluded unless status is OK. Foufi is excluded when more than 30 h old. |
-| yield10y, nasdaq, sp500 | 5, 6, 6 | only when the `FRED_API_KEY` secret is set | The observation date is recorded. |
-| sosovalue | 15 | only when the `SOSO_API_KEY` secret is set | |
-| etfflows, ninemag, strc | 10, 8, 5 | **not ported** | `etfflows` depends on the browser ETF panel logic. `ninemag` and `strc` use an unofficial Yahoo endpoint whose terms are unclear. |
+| funding, longshort, hypefunding, oil, usd, gold | 15, 10, 4, 6, 8, 5 | **yes** (Hyperliquid) | **Evidenced (indirect):** this Worker's hourly `hloi` snapshot already calls Hyperliquid in production, and `hloi` appears in 136 / 206 post-seal readings. The same calls also worked from the sandbox and from local workerd. |
+| cryptonews, macrogeo, geopolitics, regulatory | 15, 8, 10, 12 | **yes** (the RSS feeds `/news-proxy` fetches) | **Evidenced (indirect):** the page gets these through this Worker's `/news-proxy`, and all four appear in 206 / 206 readings. |
+| ninemag, strc | 8, 5 | **yes** (the Yahoo chart call `/stock-proxy` and `/strc-proxy` make) | **Evidenced (indirect):** through those routes, 206 / 206 readings. |
+| hloi, riskregime, foufi | 4, 4, 6 | **yes** (this Worker's own tables) | Internal. |
+| fng, global, onchain | 14, 6, 8 | **yes** (alternative.me, keyless CoinGecko, mempool.space) | **Not demonstrated:** the page calls these hosts directly, not through the Worker, and the sandbox blocks them. CoinGecko answered only 124 / 206 times even from the browser (rate limits). |
+| yield10y, nasdaq, sp500 | 5, 6, 6 | only with the `FRED_API_KEY` secret | FRED is reached through `/macro-proxy` (202–204 / 206). Server-side collection needs the secret. |
+| sosovalue | 15 | only with the `SOSO_API_KEY` secret | Not demonstrated from Cloudflare (the page calls it directly). |
+| etfflows | 10 | **not ported** | Depends on the browser ETF panel logic. |
 
-**Base-weight coverage** (total base weight 190):
-- **Without secrets:** 135 / 190 = **71%**.
-- **With both secrets:** 167 / 190 = **88%**.
-- The browser rule is preserved: a reading is still stored below the 50% floor, but flagged `below_floor`.
+**Base-weight coverage** (total 190):
+- **Collectable without secrets:** 148 / 190 = **78%**.
+- **Of that, upstream reachability from Cloudflare is evidenced for 120 / 190 = 63%.** The rest (fng, global, onchain = 28) is unproven until activation.
+- **With the FRED and SoSoValue secrets:** 180 / 190 = **95%**.
+
+**Floor:** below 50% completeness a reading is still stored but flagged `below_floor`, which is the browser rule.
+
+**Evidence basis:** the 206 post-seal V1 readings, by source key only (committed in PulseWorkerV2
+`research/evaluations/pev1-inputs`). Where a reading contains a source, the page obtained it through this Worker's
+proxy at that time. That is indirect evidence that Cloudflare reaches the upstream, not a test of the collector
+itself.
 
 ## Behaviour
 

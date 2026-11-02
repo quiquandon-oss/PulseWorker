@@ -1617,8 +1617,8 @@ const SCOMP_SOURCE_REGISTRY = {
   sp500:       { owner: 'FRED', endpoint: 'series SP500', cadence: 'daily, lagged', timestamp: 'observation date', auth: 'FRED_API_KEY secret', limits: '', status: 'requires_secret' },
   sosovalue:   { owner: 'SoSoValue', endpoint: 'openapi.sosovalue.com /openapi/v1/news', cadence: 'continuous', timestamp: 'fetch time', auth: 'SOSO_API_KEY secret', limits: 'account API key and its terms', status: 'requires_secret' },
   etfflows:    { owner: 'SoSoValue', endpoint: 'SoSoValue ETF flow API (browser panel)', cadence: 'daily', timestamp: 'flow date', auth: 'SOSO_API_KEY secret', limits: 'not ported yet: depends on the browser ETF panel logic', status: 'not_ported' },
-  ninemag:     { owner: 'Yahoo Finance via /stock-proxy', endpoint: 'query1.finance.yahoo.com v8 chart', cadence: 'market hours', timestamp: 'quote time', auth: 'none', limits: 'unofficial Yahoo endpoint, fragile and terms unclear; not ported', status: 'not_ported' },
-  strc:        { owner: 'Yahoo Finance via /stock-proxy', endpoint: 'STRC quote', cadence: 'market hours', timestamp: 'quote time', auth: 'none', limits: 'same as ninemag; not ported', status: 'not_ported' },
+  ninemag:     { owner: 'Yahoo Finance (same call as this Worker\'s /stock-proxy)', endpoint: 'GET query1.finance.yahoo.com/v8/finance/chart/{9 symbols}?interval=1d&range=3mo', cadence: 'US market hours', timestamp: 'publisher (oldest regularMarketTime of the symbols used)', auth: 'none', limits: 'unofficial Yahoo chart endpoint already used in production by /stock-proxy; out of market hours the value is the last close (same as the browser)', status: 'implemented' },
+  strc:        { owner: 'Yahoo Finance (same call as this Worker\'s /strc-proxy)', endpoint: 'GET query1.finance.yahoo.com/v8/finance/chart/STRC?interval=1d&range=3mo', cadence: 'US market hours', timestamp: 'publisher (regularMarketTime)', auth: 'none', limits: 'same endpoint as /strc-proxy', status: 'implemented' },
 };
 
 const scompTo0100 = (sat) => Math.round((sat + 1) * 50);
@@ -1717,7 +1717,48 @@ const scompScorers = {
     return scompTo0100(scompSatur(invert ? -pct : pct, scale));
   },
   foufi: (btcScore) => ((btcScore + 2) / 4) * 100,
+  // Port of the browser computeNineMagScore + to0_100(satur(avgPct, 2.5)): cap-weighted when every quote has a market
+  // cap (Yahoo chart meta usually has none -> equal weights), SPCX down-weighted until 180 days after its IPO.
+  ninemag: (quotes, now) => {
+    const spcx = Math.max(SCOMP_SPCX_WEIGHT_FLOOR, Math.min(1, ((now - SCOMP_SPCX_IPO_TS) / 86400000) / SCOMP_SPCX_MATURITY_DAYS));
+    const usable = SCOMP_NINE_MAG.filter(sym => { const q = quotes[sym]; return q && !q.error && q.price != null && q.prevClose != null; });
+    if (!usable.length) throw new Error('no usable 9 Magnificent quote');
+    const weighted = usable.every(sym => quotes[sym].marketCap);
+    let ws = 0, wt = 0;
+    for (const sym of usable) {
+      const q = quotes[sym];
+      let w = weighted ? q.marketCap : 1;
+      if (sym === 'SPCX') w *= spcx;
+      ws += (q.price - q.prevClose) / q.prevClose * 100 * w; wt += w;
+    }
+    return scompTo0100(scompSatur(ws / wt, 2.5));
+  },
+  // Port of the browser strcHealthScore: distance from the $100 par, steeper above par.
+  strc: (price) => {
+    if (price == null || !Number.isFinite(price)) throw new Error('STRC: no price');
+    const d = (price - 100) / 100 * 100;
+    return Math.max(0, Math.min(100, Math.round(d >= 0 ? 50 + d * 5 : 50 + d * 1.7)));
+  },
 };
+const SCOMP_NINE_MAG = ['NVDA', 'AVGO', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'SPCX'];
+const SCOMP_SPCX_IPO_TS = Date.parse('2026-06-12T00:00:00Z');
+const SCOMP_SPCX_MATURITY_DAYS = 180;
+const SCOMP_SPCX_WEIGHT_FLOOR = 0.25;
+const SCOMP_YAHOO_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// Same request and previous-close rule as /stock-proxy and /strc-proxy (daily, 3 months): the previous close is the
+// second-to-last daily close, else meta.previousClose / chartPreviousClose.
+async function scompYahooQuote(sym, opts) {
+  const res = await scompFetch(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=3mo`, { headers: { 'User-Agent': SCOMP_YAHOO_UA } }, opts);
+  const result = (await res.json())?.chart?.result?.[0];
+  const meta = result?.meta;
+  if (!meta || meta.regularMarketPrice == null) throw new Error(sym + ' no price data');
+  const closes = result.indicators?.quote?.[0]?.close || [];
+  const series = (result.timestamp || []).map((t, i) => closes[i]).filter(c => c != null);
+  const prevClose = series.length >= 2 ? series[series.length - 2] : (meta.previousClose ?? meta.chartPreviousClose);
+  return { price: meta.regularMarketPrice, prevClose, marketCap: meta.marketCap ?? null,
+    observedAt: Number.isFinite(meta.regularMarketTime) ? meta.regularMarketTime * 1000 : null, attempts: res.attempts };
+}
 const SCOMP_FRED = { yield10y: { series: 'DGS10', scale: 1.2, invert: true }, nasdaq: { series: 'NASDAQCOM', scale: 2, invert: false }, sp500: { series: 'SP500', scale: 2, invert: false } };
 const SCOMP_NEWS_FEEDS = {
   cryptonews: [{ url: 'https://cointelegraph.com/rss', name: 'CoinTelegraph' }],
@@ -1839,6 +1880,18 @@ async function collectServerSources(env, { now = Date.now(), fetchImpl = fetch, 
       const date = o?.[0]?.date ? Date.parse(o[0].date + 'T00:00:00Z') : null;
       return { [id]: { score: scompScorers.fred(o, cfg), observed_at: Number.isFinite(date) ? date : null }, __attempts: res.attempts };
     })),
+    run(['ninemag'], async () => {
+      const settled = await Promise.allSettled(SCOMP_NINE_MAG.map(sym => scompYahooQuote(sym, opts)));
+      const quotes = {};
+      settled.forEach((r, i) => { quotes[SCOMP_NINE_MAG[i]] = r.status === 'fulfilled' ? r.value : { error: String(r.reason?.message || r.reason) }; });
+      if (!Object.values(quotes).some(q => !q.error)) throw new Error('no usable 9 Magnificent quote: ' + settled.map(r => r.reason?.message).filter(Boolean).slice(0, 3).join('; '));
+      const times = Object.values(quotes).filter(q => !q.error && q.observedAt != null).map(q => q.observedAt);
+      return { ninemag: { score: scompScorers.ninemag(quotes, now), observed_at: times.length ? Math.min(...times) : null } };
+    }),
+    run(['strc'], async () => {
+      const q = await scompYahooQuote('STRC', opts);
+      return { strc: { score: scompScorers.strc(q.price), observed_at: q.observedAt }, __attempts: q.attempts };
+    }),
     run(['sosovalue'], async () => {
       if (!env.SOSO_API_KEY) return { sosovalue: { status: 'unavailable', error: 'requires SOSO_API_KEY secret on the Worker' } };
       const res = await scompFetch('https://openapi.sosovalue.com/openapi/v1/news?page_num=1&page_size=15&category_list=1,2,3,4,7,13', { headers: { 'x-soso-api-key': env.SOSO_API_KEY } }, opts);

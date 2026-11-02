@@ -37,6 +37,10 @@ const NEWS = {
   'bbci.co.uk': ['Ceasefire agreed after weeks of conflict', 'Trade war escalation feared'],
   'coindesk.com': ['SEC approves new crypto rules'], 'theblock.co': ['Regulator launches crackdown on fraud'],
 };
+// Yahoo chart fixture: daily closes ending at a deterministic price per symbol; regularMarketTime 2 h before NOW.
+const YPX = { NVDA: [100, 102], AVGO: [50, 49], AAPL: [200, 201], MSFT: [300, 297], GOOGL: [150, 153], AMZN: [180, 180], META: [400, 404], TSLA: [250, 245], SPCX: [20, 22], STRC: [98, 97.5] };
+const yahoo = (sym) => ({ chart: { result: [{ meta: { regularMarketPrice: YPX[sym][1], regularMarketTime: Math.floor((NOW - 2 * 3600000) / 1000) },
+  timestamp: [1, 2, 3], indicators: { quote: [{ close: [YPX[sym][0] - 1, YPX[sym][0], YPX[sym][1]] }] } }] } });
 const json = (b, status = 200) => ({ ok: status < 400, status, json: async () => b, text: async () => (typeof b === 'string' ? b : JSON.stringify(b)) });
 function net(over = {}) {
   const calls = [];
@@ -49,6 +53,7 @@ function net(over = {}) {
     if (url.includes('mempool')) return json({ difficultyChange: 3.1 });
     if (url.includes('stlouisfed')) return json({ observations: [{ date: '2026-10-30', value: '4.10' }, { date: '2026-10-29', value: '4.20' }] });
     if (url.includes('sosovalue')) return json({ data: { list: [{ title: 'Bitcoin ETF inflows record high' }] } });
+    if (url.includes('finance.yahoo.com')) return json(yahoo(url.match(/chart\/([A-Z]+)/)[1]));
     const host = Object.keys(NEWS).find((h) => url.includes(h));
     if (host) return json(rss(NEWS[host]));
     return json({}, 404);
@@ -81,7 +86,7 @@ describe('scomp-v1 collection', () => {
     const c = await S.collectServerSources(fakeEnv(db), { now: NOW, fetchImpl: net(), sleep: noSleep });
     const by = Object.fromEntries(c.observations.map((o) => [o.source_id, o]));
     expect(c.slotTs).toBe(Date.UTC(2026, 10, 1, 12));
-    for (const id of ['fng', 'funding', 'longshort', 'hypefunding', 'oil', 'usd', 'gold', 'global', 'onchain', 'cryptonews', 'macrogeo', 'geopolitics', 'regulatory', 'hloi', 'foufi']) {
+    for (const id of ['fng', 'funding', 'longshort', 'hypefunding', 'oil', 'usd', 'gold', 'global', 'onchain', 'cryptonews', 'macrogeo', 'geopolitics', 'regulatory', 'hloi', 'foufi', 'ninemag', 'strc']) {
       expect(by[id].status, id).toBe('ok');
       expect(by[id].score).toBeGreaterThanOrEqual(0);
     }
@@ -90,7 +95,9 @@ describe('scomp-v1 collection', () => {
     expect(by.riskregime).toMatchObject({ status: 'error', score: null });
     expect(by.riskregime.error).toMatch(/INSUFFICIENT_DATA/);
     for (const id of ['yield10y', 'nasdaq', 'sp500', 'sosovalue']) expect(by[id]).toMatchObject({ status: 'unavailable', score: null });
-    for (const id of ['etfflows', 'ninemag', 'strc']) expect(by[id].error).toMatch(/not collected server-side/);
+    expect(by.etfflows.error).toMatch(/not collected server-side/);
+    expect(by.ninemag).toMatchObject({ status: 'ok', observed_at: NOW - 2 * 3600000 });
+    expect(by.strc).toMatchObject({ status: 'ok', score: 46, observed_at: NOW - 2 * 3600000 });   // 97.5: 50 - 2.5*1.7 = 45.75 -> 46
     expect(c.observations).toHaveLength(Object.keys(S.SCOMP_SOURCE_REGISTRY).length);
   });
 
@@ -137,6 +144,26 @@ describe('scomp-v1 collection', () => {
   });
 });
 
+describe('scomp-v1 Yahoo-based sources', () => {
+  it('9 Magnificent scores the symbols that answered and records why when none did', async () => {
+    const S = load(stubs);
+    const some = net({ 'https://query1.finance.yahoo.com/v8/finance/chart/NVDA?interval=1d&range=3mo': () => json({}, 404),
+      'https://query1.finance.yahoo.com/v8/finance/chart/TSLA?interval=1d&range=3mo': () => json({}, 404) });
+    const a = await S.collectServerSources(fakeEnv(freshDb()), { now: NOW, fetchImpl: some, sleep: noSleep });
+    expect(a.observations.find((o) => o.source_id === 'ninemag').status).toBe('ok');
+    const none = net(Object.fromEntries(['NVDA', 'AVGO', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'SPCX'].map((x) => [`https://query1.finance.yahoo.com/v8/finance/chart/${x}?interval=1d&range=3mo`, () => json({}, 404)])));
+    const b = await S.collectServerSources(fakeEnv(freshDb()), { now: NOW, fetchImpl: none, sleep: noSleep });
+    expect(b.observations.find((o) => o.source_id === 'ninemag')).toMatchObject({ status: 'error', score: null });
+    expect(b.observations.find((o) => o.source_id === 'ninemag').error).toMatch(/no usable 9 Magnificent quote/);
+  });
+  it('a quote without a publisher timestamp keeps observed_at null (never a fabricated time)', async () => {
+    const S = load(stubs);
+    const f = net({ 'https://query1.finance.yahoo.com/v8/finance/chart/STRC?interval=1d&range=3mo': () => json({ chart: { result: [{ meta: { regularMarketPrice: 99 }, timestamp: [], indicators: { quote: [{ close: [] }] } }] } }) });
+    const c = await S.collectServerSources(fakeEnv(freshDb()), { now: NOW, fetchImpl: f, sleep: noSleep });
+    expect(c.observations.find((o) => o.source_id === 'strc')).toMatchObject({ status: 'ok', observed_at: null });
+  });
+});
+
 describe('scomp-v1 composite and persistence', () => {
   it('renormalises over answering sources, lists every missing one, and flags readings below the 50% floor', async () => {
     const S = load(stubs);
@@ -146,7 +173,7 @@ describe('scomp-v1 composite and persistence', () => {
     const w = S.SENTIMENT_DEFAULT_WEIGHTS;
     const exact = ok.reduce((a, o) => a + o.score * w[o.source_id][0] * w[o.source_id][1], 0) / ok.reduce((a, o) => a + w[o.source_id][0] * w[o.source_id][1], 0);
     expect(comp.composite_exact).toBeCloseTo(exact, 9);
-    expect(comp.provenance.missing.map((m) => m.id).sort()).toEqual(['etfflows', 'nasdaq', 'ninemag', 'riskregime', 'sosovalue', 'sp500', 'strc', 'yield10y']);
+    expect(comp.provenance.missing.map((m) => m.id).sort()).toEqual(['etfflows', 'nasdaq', 'riskregime', 'sosovalue', 'sp500', 'yield10y']);
     expect(comp.completeness).toBeCloseTo(ok.reduce((a, o) => a + w[o.source_id][0], 0) / Object.values(w).reduce((a, x) => a + x[0], 0), 9);
     expect(comp.below_floor).toBe(0);
     const few = { slotTs: c.slotTs, observations: c.observations.map((o) => (['fng', 'onchain'].includes(o.source_id) ? o : { ...o, status: 'error', score: null })) };
@@ -227,6 +254,24 @@ describe('parity with the browser scorers (CryptoPulse/index.html, when the chec
     }
     const batch = ['Bitcoin rally extends as ETF inflows surge', 'Exchange hacked, funds drained', 'Neutral headline'];
     expect(S.scompScoreHeadlineBatch(batch)).toBe(B.scoreHeadlineBatch(batch.map((title) => ({ title }))).score);
+  });
+
+  it('9 Magnificent and STRC scorers give the browser results (computeNineMagScore, strcHealthScore)', () => {
+    if (!html) return;
+    const consts = ["const NINE_MAG_ORDER=['NVDA','AVGO','AAPL','MSFT','GOOGL','AMZN','META','TSLA','SPCX'];",
+      "const NINE_MAG_SPCX_IPO_TS=Date.parse('2026-06-12T00:00:00Z');", 'const NINE_MAG_SPCX_MATURITY_DAYS=180;', 'const NINE_MAG_SPCX_WEIGHT_FLOOR=0.25;'];
+    for (const c of consts) expect(html, c).toContain(c);   // the constants the port copies are still the browser's
+    const S = load(stubs).scompScorers;
+    for (const at of [Date.UTC(2026, 6, 1), Date.UTC(2026, 10, 1), Date.UTC(2027, 3, 1)]) {
+      const B = new Function('Date', `${consts.join('')}\n${grab('to0_100')}\n${grab('satur')}\n${grab('spcxMaturityFactor')}\n${grab('computeNineMagScore')}\n${grab('strcHealthScore')}
+        return { computeNineMagScore, strcHealthScore, to0_100, satur };`)(Object.assign(function () {}, { now: () => at, parse: Date.parse }));
+      for (const caps of [false, true]) {
+        const quotes = Object.fromEntries(Object.entries(YPX).filter(([k]) => k !== 'STRC').map(([k, [p0, p1]], i) => [k, { price: p1, prevClose: p0, marketCap: caps ? (i + 1) * 1e11 : null }]));
+        quotes.MSFT = { error: 'HTTP 404' };
+        expect(S.ninemag(quotes, at)).toBe(B.to0_100(B.satur(B.computeNineMagScore(quotes).avgPct, 2.5)));
+      }
+      for (const px of [60, 85.3, 97.5, 99.99, 100, 100.4, 103, 120]) expect(S.strc(px)).toBe(B.strcHealthScore(px));
+    }
   });
 
   it('market scorers give the browser src* results on the same inputs', async () => {
