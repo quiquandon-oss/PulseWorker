@@ -31,6 +31,14 @@ check "status endpoint before migration" "$(code localhost:8787/server-composite
 check "cron tick with collector off" "$(code 'localhost:8787/__scheduled?cron=0+*+*+*+*')" 200
 stop; grep -q "Server composite failed" "$WORK/dev.log" && { echo "FAIL collector ran while off"; exit 1; } || echo "PASS collector did not run while SERVER_COMPOSITE is unset"
 
+echo "== 2a. backup (the exact release command, against the local DB) and a restore drill"
+$W d1 execute DB --local --command "INSERT INTO history (ts, score, sources_json) VALUES (1793500000000, 48, '{\"fng\":40}')" >/dev/null
+$W d1 export DB --local --output backup.sql >/dev/null; [ -s backup.sql ] && echo "PASS backup written ($(wc -c < backup.sql) bytes)"
+before=$($W d1 execute DB --local --json --command "SELECT COUNT(*) n FROM history" 2>/dev/null | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s.slice(s.indexOf('[')))[0].results[0].n))")
+$W d1 execute DB --local --persist-to restore-drill --file backup.sql >/dev/null
+after=$($W d1 execute DB --local --persist-to restore-drill --json --command "SELECT COUNT(*) n FROM history" 2>/dev/null | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s.slice(s.indexOf('[')))[0].results[0].n))")
+[ "$before" = "$after" ] && [ "$before" -ge 1 ] && echo "PASS backup restores into an empty database ($after history rows)" || { echo "FAIL restore drill: $before vs $after"; exit 1; }
+
 echo "== 2. migrations (applied twice: idempotent)"
 for f in db/migrations/0001_history_provenance.sql db/migrations/0002_server_composite.sql db/migrations/0001_history_provenance.sql db/migrations/0002_server_composite.sql; do $W d1 execute DB --local --file "$f" >/dev/null; echo "PASS applied $f"; done
 
@@ -40,6 +48,10 @@ check "POST /history with provenance" "$(post "$BODY")" 200; has "provenance rec
 check "retry" "$(post "$BODY")" 200; has "retry deduplicated" '"duplicate":true'
 check "cron tick" "$(code 'localhost:8787/__scheduled?cron=0+*+*+*+*')" 200
 sleep 15; check "status" "$(code 'localhost:8787/server-composite/status?hours=2')" 200; has "one composite reading for the slot" '"readings":{"n":1'
+check "acceptance endpoint" "$(code 'localhost:8787/server-composite/acceptance?hours=24')" 200; has "one slot is reported as an insufficient window, not a pass" '"verdict":"INSUFFICIENT_WINDOW"'
+has "failed sources are visible with their errors" '"last_error":{'
+rc=0; node "$REPO/scripts/validate-collector.mjs" http://localhost:8787 24 > validate.out 2>&1 || rc=$?
+[ "$rc" = 2 ] && grep -q "VERDICT: INSUFFICIENT_WINDOW" validate.out && echo "PASS validator runs read-only and exits 2 (insufficient window)" || { echo "FAIL validator rc=$rc"; cat validate.out; exit 1; }
 check "second tick in the same hour" "$(code 'localhost:8787/__scheduled?cron=0+*+*+*+*')" 200
 sleep 10; code 'localhost:8787/server-composite/status?hours=2' >/dev/null; has "still one reading (slot idempotent)" '"readings":{"n":1'
 stop

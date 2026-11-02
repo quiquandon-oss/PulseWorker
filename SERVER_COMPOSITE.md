@@ -58,6 +58,41 @@ itself.
   slots, the last ok observation and the mean age; for readings, the count, below-floor count and completeness. It is
   read-only and reports "tables not created" when the migration has not been applied.
 
+## Collection acceptance criteria (`scomp-acceptance-v1`)
+
+**Where they are computed:** read-only, from what the collector stored, by `GET /server-composite/acceptance?hours=N`
+(`evaluateCollectionAcceptance` in `worker.js`). `node scripts/validate-collector.mjs [base-url] [hours]` prints them
+with a per-source table that keeps successes and failures apart.
+
+**Window:** it starts at the later of (now − N h) and the first stored slot, so activation time does not count as a
+gap. Fewer than 24 expected hour slots → **INSUFFICIENT_WINDOW**, never PASS.
+
+| # | Criterion | Measure | Threshold |
+|---|---|---|---|
+| A1 | Hourly completeness | distinct hour slots with a reading ÷ expected slots | ≥ 0.95 |
+| A2 | Composite completeness | readings at ≥ 50% of base weight (not `below_floor`) ÷ readings | ≥ 0.90 |
+| A3 | Source coverage | base-weight share of implemented sources whose ok observations ÷ expected slots is ≥ 0.90 | ≥ 0.60 |
+| A4 | Freshness | ok observations whose age is within the source's limit ÷ ok observations | ≥ 0.99 |
+| A5 | Timestamp validity | ok observations with an observation time that is (a) present, (b) not after the fetch (5 min skew allowed) and (c) for live snapshots, equal to the fetch time | **= 1.0 (strict)** |
+| A6 | Retry behaviour | observations with more than 2 attempts | = 0; the retried share is reported |
+| A7 | Idempotency | duplicate readings per slot, plus slots without exactly one row per registered source | = 0 |
+| A8 | Error visibility | non-ok observations without an error message | = 0 |
+
+**Freshness limits (A4):**
+
+| Sources | Limit |
+|---|---|
+| fng | 36 h |
+| global | 2 h |
+| foufi | 30 h |
+| FRED series | 5 days (daily, published with a lag) |
+| Yahoo (ninemag, strc) | 4 days (last close over a long weekend) |
+| hloi, riskregime | 2 h |
+| Live snapshots | 1 h (stamped at fetch time) |
+
+**The A3 threshold, 0.60,** is just below the 63% of base weight whose upstream reachability is already indirectly
+evidenced. The first 24 h will show whether fng, global and onchain reach it.
+
 ## Verification done (2026-11-01)
 
 - **Unit and contract tests:** `tests/server-composite.test.js` (14 tests).

@@ -7,7 +7,10 @@ units without a reading.
 **Status.** Not executed. Merging, applying migrations and setting variables are owner actions.
 
 **Rehearsed locally:** every step marked **[rehearsed]** passed in `scripts/rehearse-sentiment-release.sh` (workerd
-via `wrangler dev --local` and a local D1; no account and no production data): **28 / 28 checks** on 2026-11-02.
+via `wrangler dev --local` and a local D1; no account and no production data): **34 / 34 checks** on 2026-11-02.
+The checks cover the backup and a restore drill, migrations applied twice, activation, the acceptance endpoint and
+validator, and the code and data rollbacks. CryptoPulse #6's page was also run in headless Chromium against this
+Worker: the provenance it built was stored and reproduced server-side.
 
 **No dependency on other PRs.** In particular this release needs no token and no secret.
 
@@ -21,7 +24,7 @@ via `wrangler dev --local` and a local D1; no account and no production data): *
 | 4 | Set `HISTORY_PROVENANCE = 1` and `SERVER_COMPOSITE = 1`. **[rehearsed]** | Provenance is recorded; the hourly cron collects one reading per hour slot. |
 | 5 | After 2 h and after 24 h: check the status endpoint. | Read-only. |
 
-### Step 3 commands
+### Step 3 commands **[rehearsed: the backup is restored into an empty database and compared]**
 
 ```bash
 npx wrangler@3 d1 export sentiment-history --remote --output backup-$(date +%F).sql
@@ -37,25 +40,23 @@ npx wrangler@3 d1 execute sentiment-history --remote --command \
 Cloudflare dashboard → Workers → `sentiment-ff75` → Settings → Variables (plain text):
 `HISTORY_PROVENANCE = 1`, `SERVER_COMPOSITE = 1`.
 
-### Step 5: first real-world evidence of source availability
+### Step 5: validate against actual source responses **[rehearsed]**
 
 ```bash
-curl -s "https://sentiment-ff75.quiquandon.workers.dev/server-composite/status?hours=24" \
-  | jq '{readings, sources: [.sources[] | {id, n_ok, n, coverage}]}'
+node scripts/validate-collector.mjs https://sentiment-ff75.quiquandon.workers.dev 2     # after ~2 h: INSUFFICIENT_WINDOW (exit 2), table shows each source's real status
+node scripts/validate-collector.mjs https://sentiment-ff75.quiquandon.workers.dev 24    # after 24 h: verdict PASS (exit 0) or FAIL (exit 1)
 ```
 
-**Expected:**
-- `readings.n` is roughly the number of hours since activation.
-- `readings.n_below_floor` is low.
+**What this is:** the first direct evidence of what the deployed collector actually obtains from each source. The
+mocked tests and the indirect reachability evidence in `SERVER_COMPOSITE.md` do not prove collector coverage.
 
-**Per source:**
-- `coverage` is the share of expected hourly slots with an ok reading.
-- **Expected to work, with indirect production evidence:** Hyperliquid, the RSS feeds and Yahoo. See the table in
-  `SERVER_COMPOSITE.md`.
-- **First real evidence, either way:** alternative.me (`fng`), CoinGecko (`global`) and mempool.space (`onchain`).
+**What to report per source:** the ok share, counts by status (ok, error, timeout, stale, unavailable) and the last
+error message.
 
-**Sources without credentials:** yield10y, nasdaq, sp500 and sosovalue show `unavailable` with the reason "requires
-…_API_KEY secret" unless those secrets exist.
+**Acceptance:** the criteria A1–A8 are in `SERVER_COMPOSITE.md`. A FAIL names the criterion and the failing sources.
+
+**Expected:** yield10y, nasdaq, sp500 and sosovalue show `unavailable` ("requires …_API_KEY secret") unless those
+secrets exist, and etfflows shows `unavailable` (not ported).
 
 ## Rollback **[rehearsed]**
 

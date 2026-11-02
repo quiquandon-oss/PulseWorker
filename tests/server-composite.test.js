@@ -18,7 +18,7 @@ function load(stubs = {}) {
     constLine('V1_COMPOSITE_FORMULA'), objConst('SENTIMENT_DEFAULT_WEIGHTS'), constLine('SENTIMENT_DEFAULT_WEIGHTS_VERSION'),
     extractFunctions('parseRssTitles', 'stripHtml', 'recomputeComposite'),
     between('// ═══ Server-side V1 sentiment collection', 'export default {'),
-    'return { collectServerSources, buildServerComposite, runServerComposite, getServerCompositeStatus, scompScoreHeadline, scompScoreHeadlineBatch, scompScorers, scompFetch, SCOMP_SENT_LEXICON, SCOMP_SOURCE_REGISTRY, SENTIMENT_DEFAULT_WEIGHTS };',
+    'return { collectServerSources, buildServerComposite, runServerComposite, getServerCompositeStatus, evaluateCollectionAcceptance, getServerCompositeAcceptance, SCOMP_ACCEPTANCE, scompScoreHeadline, scompScoreHeadlineBatch, scompScorers, scompFetch, SCOMP_SENT_LEXICON, SCOMP_SOURCE_REGISTRY, SENTIMENT_DEFAULT_WEIGHTS };',
   ].join('\n\n');
   const names = Object.keys(stubs);
   return new Function(...names, body)(...names.map((n) => stubs[n]));
@@ -293,5 +293,72 @@ describe('parity with the browser scorers (CryptoPulse/index.html, when the chec
     for (const ctx of [{}, { btcChg: -1, equitiesScore: 30 }, { btcChg: -1, equitiesScore: 70 }]) expect(S.gold(xyz, ctx)).toBe((await B.srcGoldFromHyperliquid(ctx)).score);
     expect(S.onchain({ difficultyChange: 3.1 })).toBe((await B.srcOnChain()).score);
     expect(S.global({ data: { market_cap_change_percentage_24h_usd: -2.4 } })).toBe((await B.srcGlobalMcap()).score);
+  });
+});
+
+describe('collection acceptance criteria (scomp-acceptance-v1)', () => {
+  const S = load(stubs);
+  const IDS = Object.keys(S.SCOMP_SOURCE_REGISTRY);
+  const PUB = { fng: 3 * H, global: 600000, foufi: 5 * H, ninemag: 2 * H, strc: 2 * H, hloi: 20 * 60000, riskregime: 30 * 60000, yield10y: 30 * H, nasdaq: 30 * H, sp500: 30 * H };
+  function window(nSlots, mutate = () => {}) {
+    const end = Math.floor(NOW / H) * H;
+    const obs = [], rd = [];
+    for (let k = nSlots - 1; k >= 0; k--) {
+      const slot = end - k * H, fetched = slot + 5 * 60000;
+      rd.push({ slot_ts: slot, completeness: 0.75, below_floor: 0 });
+      for (const id of IDS) {
+        const st = S.SCOMP_SOURCE_REGISTRY[id].status;
+        obs.push(st === 'implemented'
+          ? { slot_ts: slot, source_id: id, status: 'ok', score: 50, observed_at: fetched - (PUB[id] || 0), fetched_at: fetched, attempts: 1, error: null }
+          : { slot_ts: slot, source_id: id, status: 'unavailable', score: null, observed_at: null, fetched_at: fetched, attempts: null, error: 'requires secret' });
+      }
+    }
+    mutate(obs, rd);
+    return S.evaluateCollectionAcceptance(obs, rd, { now: NOW, hours: 168 });
+  }
+  it('a complete, fresh, consistent window passes every criterion', () => {
+    const r = window(30);
+    expect(r.verdict).toBe('PASS');
+    expect(Object.entries(r.criteria).filter(([, c]) => !c.pass)).toEqual([]);
+    expect(r.window.expected_slots).toBe(30);                                  // activation time not counted as a gap
+  });
+  it('fewer than 24 expected slots is INSUFFICIENT_WINDOW, not PASS', () => {
+    expect(window(10).verdict).toBe('INSUFFICIENT_WINDOW');
+  });
+  it('each criterion fails on its own defect', () => {
+    const fails = (mut) => Object.entries(window(30, mut).criteria).filter(([, c]) => !c.pass).map(([k]) => k);
+    expect(fails((o, r) => { r.splice(5, 3); })).toEqual(['A1_hourly_completeness']);
+    expect(fails((o, r) => { r.slice(0, 5).forEach((x) => { x.below_floor = 1; }); })).toEqual(['A2_above_completeness_floor']);
+    expect(fails((o) => { o.filter((x) => ['funding', 'cryptonews', 'fng', 'longshort', 'sosovalue', 'regulatory', 'macrogeo', 'geopolitics'].includes(x.source_id)).forEach((x) => { x.status = 'error'; x.score = null; x.error = 'HTTP 503'; }); }))
+      .toEqual(['A3_source_coverage_weight']);
+    // A4 is a share (>= 99%): two stale values in ~600 ok observations pass, ten fail
+    expect(fails((o) => { o.filter((x) => x.source_id === 'fng').slice(0, 2).forEach((x) => { x.observed_at = x.fetched_at - 40 * H; }); })).toEqual([]);
+    expect(fails((o) => { o.filter((x) => x.source_id === 'fng').slice(0, 10).forEach((x) => { x.observed_at = x.fetched_at - 40 * H; }); })).toEqual(['A4_freshness']);
+    // A5 is strict: one observation time in the future, or a publisher source without one, fails
+    expect(fails((o) => { o.find((x) => x.source_id === 'oil').observed_at += 3600000; })).toEqual(['A5_timestamp_validity']);
+    expect(fails((o) => { o.find((x) => x.source_id === 'strc').observed_at = null; })).toEqual(['A5_timestamp_validity']);
+    expect(fails((o) => { o[0].attempts = 3; })).toEqual(['A6_retry_bounded']);
+    expect(fails((o, r) => { r.push({ ...r[0] }); })).toEqual(['A7_idempotency']);
+    expect(fails((o) => { o.pop(); })).toEqual(['A7_idempotency']);
+    expect(fails((o) => { o.find((x) => x.status !== 'ok').error = ''; })).toEqual(['A8_error_visibility']);
+  });
+  it('per-source report separates statuses and shows the last error', () => {
+    const r = window(30, (o) => { o.filter((x) => x.source_id === 'onchain').slice(-2).forEach((x) => { x.status = 'timeout'; x.score = null; x.error = 'timeout after 8000 ms'; }); });
+    expect(r.sources.onchain.by_status).toEqual({ ok: 28, timeout: 2 });
+    expect(r.sources.onchain.last_error).toMatchObject({ status: 'timeout', error: 'timeout after 8000 ms' });
+    expect(r.sources.etfflows.implemented).toBe(false);
+  });
+  it('end to end: 26 hourly collector runs on the real schema evaluate to PASS; the endpoint reports missing tables', async () => {
+    const db = freshDb();
+    const env = fakeEnv(db);
+    for (let k = 25; k >= 0; k--) await S.runServerComposite(env, { now: NOW - k * H, fetchImpl: net(), sleep: noSleep });
+    const r = await S.getServerCompositeAcceptance(env, NOW + 10 * 60000, 48);
+    expect(r.window.expected_slots).toBe(26);
+    expect(r.criteria.A7_idempotency.pass).toBe(true);
+    expect(r.criteria.A8_error_visibility.pass).toBe(true);
+    expect(r.criteria.A6_retry_bounded.pass).toBe(true);
+    expect(r.sources.riskregime.by_status).toEqual({ error: 26 });              // stubbed INSUFFICIENT_DATA: visible
+    const missing = await S.getServerCompositeAcceptance(fakeEnv(new DatabaseSync(':memory:')), NOW, 24);
+    expect(missing.error).toMatch(/apply db\/migrations\/0002/);
   });
 });

@@ -1972,6 +1972,93 @@ async function getServerCompositeStatus(env, now = Date.now(), hours = 168) {
   }
 }
 
+
+// ═══ Collection acceptance criteria (scomp-acceptance-v1) ═══
+// Measurable pass/fail criteria for the server-side collector, computed from what it stored (read-only). The window
+// starts at the later of (now - hours) and the first stored slot, so activation time is not counted as a gap.
+// Thresholds are fixed here and in SERVER_COMPOSITE.md; a window shorter than 24 expected slots is INSUFFICIENT.
+const SCOMP_ACCEPTANCE = {
+  version: 'scomp-acceptance-v1',
+  min_expected_slots: 24,
+  hourly_completeness: 0.95,      // A1 readings / expected hour slots
+  above_floor_share: 0.90,        // A2 readings with completeness >= 50%
+  source_ok_share: 0.90,          // A3 per implemented source: ok observations / expected slots
+  passing_weight_share: 0.60,     // A3 base-weight share of sources meeting source_ok_share
+  fresh_share: 0.99,              // A4 ok observations within the source's freshness limit
+  valid_timestamp_share: 1.0,     // A5 every ok observation has a valid observation time (strict: an invalid one is a defect)
+  clock_skew_ms: 5 * 60000,
+  max_attempts: 2,                // A6 one retry at most
+};
+// Freshness limit per source: publisher-timestamped sources by their cadence; live snapshots must be ~fetch time.
+const SCOMP_PUBLISHER_TS = new Set(['fng', 'global', 'foufi', 'yield10y', 'nasdaq', 'sp500', 'ninemag', 'strc', 'hloi', 'riskregime']);
+function scompMaxAgeMs(id) {
+  const reg = SCOMP_SOURCE_REGISTRY[id] || {};
+  if (reg.maxAgeMs) return reg.maxAgeMs;
+  if (['yield10y', 'nasdaq', 'sp500'].includes(id)) return 5 * 24 * SCOMP_H;   // daily series, weekend + holiday lag
+  if (['ninemag', 'strc'].includes(id)) return 4 * 24 * SCOMP_H;              // last close over a long weekend
+  if (['hloi', 'riskregime'].includes(id)) return 2 * SCOMP_H;                // this Worker's hourly snapshots
+  return SCOMP_H;                                                             // live snapshots stamped at fetch time
+}
+
+// Pure: observations [{slot_ts, source_id, status, score, observed_at, fetched_at, attempts, error}],
+// readings [{slot_ts, completeness, below_floor}] -> criteria with value, threshold, pass.
+function evaluateCollectionAcceptance(observations, readings, { now, hours, weights = SENTIMENT_DEFAULT_WEIGHTS } = {}) {
+  const A = SCOMP_ACCEPTANCE;
+  const slots = [...new Set(readings.map(r => r.slot_ts))].sort((a, b) => a - b);
+  const windowStart = Math.max(Math.floor((now - hours * SCOMP_H) / SCOMP_H) * SCOMP_H, slots.length ? slots[0] : now);
+  const lastFull = Math.floor(now / SCOMP_H) * SCOMP_H;                 // the current hour's slot may still be running
+  const expected = Math.max(0, Math.round((lastFull - windowStart) / SCOMP_H) + (slots.includes(lastFull) ? 1 : 0));
+  const inWin = (x) => x.slot_ts >= windowStart;
+  const R = readings.filter(inWin), O = observations.filter(inWin);
+  const implemented = Object.keys(SCOMP_SOURCE_REGISTRY).filter(id => SCOMP_SOURCE_REGISTRY[id].status === 'implemented');
+  const share = (n, d) => (d ? n / d : null);
+  const crit = {};
+  const put = (k, value, threshold, extra = {}) => { crit[k] = { value: value == null ? null : Math.round(value * 1e4) / 1e4, threshold, pass: value != null && value >= threshold, ...extra }; };
+  put('A1_hourly_completeness', share(new Set(R.map(r => r.slot_ts)).size, expected), A.hourly_completeness, { readings: R.length, expected_slots: expected });
+  put('A2_above_completeness_floor', share(R.filter(r => !r.below_floor).length, R.length), A.above_floor_share);
+  const perSource = {};
+  for (const id of Object.keys(SCOMP_SOURCE_REGISTRY)) {
+    const rows = O.filter(o => o.source_id === id);
+    const byStatus = {};
+    for (const o of rows) byStatus[o.status] = (byStatus[o.status] || 0) + 1;
+    const lastErr = rows.filter(o => o.status !== 'ok').sort((a, b) => b.slot_ts - a.slot_ts)[0];
+    perSource[id] = { implemented: implemented.includes(id), ok_share: share(byStatus.ok || 0, expected), by_status: byStatus,
+      last_error: lastErr ? { slot_ts: lastErr.slot_ts, status: lastErr.status, error: lastErr.error } : null };
+  }
+  const passing = implemented.filter(id => (perSource[id].ok_share ?? 0) >= A.source_ok_share);
+  const wTotal = Object.values(weights).reduce((a, w) => a + w[0], 0) || 1;
+  put('A3_source_coverage_weight', passing.reduce((a, id) => a + (weights[id]?.[0] || 0), 0) / wTotal, A.passing_weight_share,
+    { sources_passing: passing, sources_failing: implemented.filter(id => !passing.includes(id)) });
+  const ok = O.filter(o => o.status === 'ok');
+  put('A4_freshness', share(ok.filter(o => o.observed_at != null && o.fetched_at - o.observed_at <= scompMaxAgeMs(o.source_id)).length, ok.length), A.fresh_share);
+  put('A5_timestamp_validity', share(ok.filter(o => o.observed_at != null && o.observed_at <= o.fetched_at + A.clock_skew_ms
+    && (SCOMP_PUBLISHER_TS.has(o.source_id) || Math.abs(o.fetched_at - o.observed_at) <= A.clock_skew_ms)).length, ok.length), A.valid_timestamp_share);
+  const overAttempts = O.filter(o => o.attempts != null && o.attempts > A.max_attempts).length;
+  crit.A6_retry_bounded = { value: overAttempts, threshold: 0, pass: overAttempts === 0, retried_share: share(O.filter(o => o.attempts === 2).length, O.filter(o => o.attempts != null).length) };
+  const perSlot = {};
+  for (const o of O) perSlot[o.slot_ts] = (perSlot[o.slot_ts] || 0) + 1;
+  const nSources = Object.keys(SCOMP_SOURCE_REGISTRY).length;
+  const dupReadings = R.length - new Set(R.map(r => r.slot_ts)).size;
+  const badSlots = Object.values(perSlot).filter(n => n !== nSources).length;
+  crit.A7_idempotency = { value: dupReadings + badSlots, threshold: 0, pass: dupReadings + badSlots === 0, duplicate_readings: dupReadings, slots_without_exactly_one_row_per_source: badSlots };
+  const silent = O.filter(o => o.status !== 'ok' && !(o.error && String(o.error).trim())).length;
+  crit.A8_error_visibility = { value: silent, threshold: 0, pass: silent === 0, failed_observations: O.filter(o => o.status !== 'ok').length };
+  const sufficient = expected >= A.min_expected_slots;
+  return { version: A.version, window: { start: windowStart, now, expected_slots: expected }, verdict: !sufficient ? 'INSUFFICIENT_WINDOW'
+    : Object.values(crit).every(c => c.pass) ? 'PASS' : 'FAIL', criteria: crit, sources: perSource };
+}
+
+async function getServerCompositeAcceptance(env, now = Date.now(), hours = 24) {
+  const since = Math.floor((now - hours * SCOMP_H) / SCOMP_H) * SCOMP_H;
+  try {
+    const { results: obs } = await env.DB.prepare('SELECT slot_ts, source_id, status, score, observed_at, fetched_at, attempts, error FROM server_source_observations WHERE slot_ts >= ?').bind(since).all();
+    const { results: rd } = await env.DB.prepare('SELECT slot_ts, completeness, below_floor FROM server_composite_readings WHERE slot_ts >= ?').bind(since).all();
+    return { ok: true, enabled: env.SERVER_COMPOSITE === '1', ...evaluateCollectionAcceptance(obs || [], rd || [], { now, hours }) };
+  } catch (e) {
+    return { ok: false, error: /no such table/i.test(String(e.message)) ? 'tables not created: apply db/migrations/0002_server_composite.sql' : String(e.message || e) };
+  }
+}
+
 export default {
   async scheduled(event, env, ctx) {
     // Three crons share this handler now (see wrangler.toml): "0 6,18 * * *"
@@ -2020,6 +2107,11 @@ export default {
     }
 
     // GET /server-composite/status -- read-only coverage/freshness/completeness of the server-side collector.
+    // GET /server-composite/acceptance?hours=24 -- read-only pass/fail of the collection acceptance criteria.
+    if (url.pathname === '/server-composite/acceptance' && request.method === 'GET') {
+      const hours = Math.min(168, Math.max(1, parseInt(url.searchParams.get('hours') || '24', 10) || 24));
+      return new Response(JSON.stringify(await getServerCompositeAcceptance(env, Date.now(), hours)), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+    }
     if (url.pathname === '/server-composite/status' && request.method === 'GET') {
       const hours = Math.min(24 * 90, Math.max(1, parseInt(url.searchParams.get('hours') || '168', 10) || 168));
       return new Response(JSON.stringify(await getServerCompositeStatus(env, Date.now(), hours)), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
