@@ -1386,6 +1386,67 @@ async function getWeightAdaptation(env, now = Date.now()) {
     history: history.map(({ evidence, prev_weights, ...h }) => h), generated_ts: now };
 }
 
+// ═══ V1 route authentication (sec-v1, 2026-11-01) ═══
+// Every route that writes, spends paid AI/Gemini quota, sends Telegram messages or returns private financial data
+// requires `X-V1-Token` equal to the V1_ACCESS_TOKEN secret, compared in constant time. The token is never in the
+// page: each device enters it once (V1 Settings -> stored in that browser's localStorage).
+// Fail mode: CLOSED. While V1_ACCESS_TOKEN is not set, every protected route answers 503 and runs nothing.
+// Release order therefore matters (SECURITY.md): set the secret BEFORE deploying this code.
+// X-App-Secret is not accepted: its value has been public in the CryptoPulse page since 2026-08-07.
+const V1_PROTECTED_ROUTES = new Set([
+  'POST:/whale-analysis', 'POST:/whale-log', 'POST:/portfolio-log', 'POST:/txs-backup', 'GET:/txs-backup',
+  'GET:/portfolio-history', 'POST:/liquidation-analysis', 'POST:/history', 'POST:/backfill-sources',
+  'POST:/alert-configs', 'POST:/alert-configs/toggle', 'POST:/alert-configs/delete', 'POST:/test-telegram',
+  'GET:/run-technical-eval', 'POST:/run-technical-eval', 'POST:/trader-analysis', 'POST:/trader-analysis-gemini',
+  'POST:/gemini-outlook', 'GET:/foufi-backfill-rss', 'GET:/foufi-check',
+  // Routes that spend the owner's third-party quotas with server-held keys.
+  'GET:/macro-proxy', 'GET:/api-proxy/coingecko', 'GET:/api-proxy/sosovalue',
+]);
+
+function v1TimingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return diff === 0;
+}
+
+// 'public' (route not protected), 'unconfigured' (protected route, no token configured: refused), 'ok', 'rejected'.
+function v1RouteAuth(request, url, env) {
+  if (!V1_PROTECTED_ROUTES.has(`${request.method}:${url.pathname}`)) return 'public';
+  if (typeof env.V1_ACCESS_TOKEN !== 'string' || env.V1_ACCESS_TOKEN.length < 32) return 'unconfigured';
+  return v1TimingSafeEqual(request.headers.get('X-V1-Token') || '', env.V1_ACCESS_TOKEN) ? 'ok' : 'rejected';
+}
+
+// ---- Third-party API keys held by the Worker instead of the public page ----
+// Allowlisted upstream paths only (no open proxy); short edge cache bounds quota use by anonymous callers.
+const V1_PROXY_UPSTREAMS = {
+  coingecko: { base: 'https://api.coingecko.com/api/v3', paths: [/^\/global$/, /^\/simple\/price$/, /^\/coins\/markets$/, /^\/coins\/[a-z0-9-]{1,64}\/market_chart$/],
+    keyHeader: 'x-cg-demo-api-key', keyEnv: 'CG_API_KEY', keyRequired: false, cacheTtl: 60 },
+  sosovalue: { base: 'https://openapi.sosovalue.com/openapi/v1', paths: [/^\/news$/, /^\/etfs\/summary-history$/],
+    keyHeader: 'x-soso-api-key', keyEnv: 'SOSO_API_KEY', keyRequired: true, cacheTtl: 300 },
+};
+
+function v1ProxyTarget(service, path, search) {
+  const up = V1_PROXY_UPSTREAMS[service];
+  if (!up) return { error: 'unknown service', status: 404 };
+  if (typeof path !== 'string' || !up.paths.some(re => re.test(path))) return { error: 'path not allowed', status: 403 };
+  const qs = new URLSearchParams(search);
+  qs.delete('path');
+  return { up, url: `${up.base}${path}${[...qs].length ? '?' + qs.toString() : ''}` };
+}
+
+async function handleV1Proxy(service, url, env, corsHeaders, fetchImpl = fetch) {
+  const t = v1ProxyTarget(service, url.searchParams.get('path'), url.search);
+  const json = (o, status) => new Response(JSON.stringify(o), { status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  if (t.error) return json({ error: t.error }, t.status);
+  const key = env[t.up.keyEnv];
+  if (t.up.keyRequired && !key) return json({ error: `${t.up.keyEnv} is not configured on the Worker` }, 503);
+  const headers = { accept: 'application/json' };
+  if (key) headers[t.up.keyHeader] = key;
+  const res = await fetchImpl(t.url, { headers, cf: { cacheTtl: t.up.cacheTtl, cacheEverything: true } });
+  return new Response(await res.text(), { status: res.status, headers: { ...corsHeaders, 'Content-Type': res.headers?.get?.('Content-Type') || 'application/json' } });
+}
+
 export default {
   async scheduled(event, env, ctx) {
     // Three crons share this handler now (see wrangler.toml): "0 6,18 * * *"
@@ -1419,7 +1480,7 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-App-Secret',
+      'Access-Control-Allow-Headers': 'Content-Type, X-App-Secret, X-V1-Token',
     };
 
     // GET /weight-adaptation -- read-only: shadow weight proposals, evidence, out-of-sample check.
@@ -1449,6 +1510,31 @@ export default {
       }
     }
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
+
+    // sec-v1 gate (see V1_PROTECTED_ROUTES): before any protected handler runs.
+    {
+      const auth = v1RouteAuth(request, url, env);
+      if (auth === 'unconfigured') {
+        return new Response(JSON.stringify({ error: 'protected route disabled: V1_ACCESS_TOKEN is not configured on the Worker' }), { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      if (auth === 'rejected') {
+        return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+    // GET /security-status -- read-only: is the gate enforcing, and which server-held keys exist (names only).
+    if (url.pathname === '/security-status' && request.method === 'GET') {
+      return new Response(JSON.stringify({ ok: true, version: 'sec-v1', route_auth: (typeof env.V1_ACCESS_TOKEN === 'string' && env.V1_ACCESS_TOKEN.length >= 32) ? 'enforced' : 'closed: protected routes refuse (V1_ACCESS_TOKEN missing or shorter than 32 chars)',
+        protected_routes: [...V1_PROTECTED_ROUTES], server_keys: { FRED_API_KEY: !!env.FRED_API_KEY, CG_API_KEY: !!env.CG_API_KEY, SOSO_API_KEY: !!env.SOSO_API_KEY },
+        client_supplied_fred_key_accepted: !env.FRED_API_KEY }), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+    }
+    // GET /api-proxy/coingecko?path=/global ... and /api-proxy/sosovalue?path=/news ... (allowlisted; keys stay server-side)
+    if (request.method === 'GET' && url.pathname.startsWith('/api-proxy/')) {
+      try {
+        return await handleV1Proxy(url.pathname.slice('/api-proxy/'.length), url, env, corsHeaders);
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err.message || err) }), { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
 
     // ---- GET /news-proxy?source=crypto|macro|geopolitics|regulatory ----
     if (url.pathname === '/news-proxy' && request.method === 'GET') {
@@ -2364,7 +2450,9 @@ RULES:
     // ---- GET /macro-proxy?series=DGS10&key=XXX&limit=5 — FRED proxy (avoids CORS) ----
     if (url.pathname === '/macro-proxy' && request.method === 'GET') {
       const series = url.searchParams.get('series');
-      const key = url.searchParams.get('key');
+      // sec-v1: a server-held FRED_API_KEY always wins; the client-supplied key is only accepted while none is set
+      // (transition), so the page can stop shipping the key as soon as the secret exists.
+      const key = env.FRED_API_KEY || url.searchParams.get('key');
       // Optional, defaults to 5 (unchanged behavior for existing callers) — a
       // caller wanting a real multi-week trend (e.g. sector-rotation) instead
       // of just the latest-vs-previous pair can request more, capped at 90 to
