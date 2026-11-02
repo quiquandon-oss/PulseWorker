@@ -4,7 +4,18 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import worker from '../worker.js';
+import rawWorker from '../worker.js';
+
+// Every request authenticates as a V1 device would (X-V1-Token / V1_ACCESS_TOKEN). On a Worker without the sec-v1
+// route gate these are ignored; with it (PulseWorker #4) the history routes are fail-closed and need them.
+const V1_TOKEN = 'history-tests-v1-access-token-0123456789abcdef';
+const worker = {
+  fetch: (req, env) => {
+    const headers = new Headers(req.headers);
+    if (!headers.has('X-V1-Token')) headers.set('X-V1-Token', V1_TOKEN);
+    return rawWorker.fetch(new Request(req, { headers }), { V1_ACCESS_TOKEN: V1_TOKEN, ...env });
+  },
+};
 
 // vite does not resolve node:sqlite as a builtin yet; plain require does.
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
