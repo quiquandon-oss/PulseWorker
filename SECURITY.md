@@ -25,50 +25,39 @@
   Look for requests to `/txs-backup`, `/portfolio-history` and the POST routes from user agents other than your
   browsers. Also check the Gemini and Workers AI usage graphs for unexplained spikes.
 
-## Remediation in this change (inert until configured; safe to deploy)
+## Remediation in this change
 
-- **Route gate:**
-  - `V1_PROTECTED_ROUTES` (20 routes) require `X-V1-Token` equal to the `V1_ACCESS_TOKEN` secret, compared in
-    constant time.
-  - A rejected request touches neither D1 nor the network (tested).
-  - **Fail mode:** the gate is open only while `V1_ACCESS_TOKEN` is unset, which avoids a repeat of the 2026-08-11
-    outage. `/security-status` shows whether it is enforcing.
-  - **Public reads stay public:** `/history`, the news, stock, STRC and whale proxies, `/foufi-*` reads, `/risk-regime`,
-    `/hl-oi`, `/alert-configs` and `/alert-log` reads, and `/analysis`.
-- **Third-party keys move to Worker secrets:**
-  - `/macro-proxy` uses `FRED_API_KEY` when it is set and ignores any client-supplied key.
-  - `/api-proxy/coingecko` and `/api-proxy/sosovalue` forward only allowlisted upstream paths, add the server-held key
-    (`CG_API_KEY`, `SOSO_API_KEY`) and edge-cache responses for 60 s and 300 s respectively.
-- **Deploy:** `deploy.yml` now runs `npm test` before deploying.
-- **Frontend:** the companion CryptoPulse PR removes every embedded key and secret from the page. It sends the device
-  token from Settings and calls the proxies.
+- **Fail-closed route gate.** `V1_PROTECTED_ROUTES` (23 routes) require `X-V1-Token` equal to the `V1_ACCESS_TOKEN`
+  secret, compared in constant time.
+  - **Missing or weak secret** (fewer than 32 characters): every protected route answers **503** and runs nothing.
+  - **Missing or wrong token:** **401**.
+  - **Either way,** D1 and the network are never touched (tested).
+  - **Also protected:** the routes that spend the owner's third-party quotas, `/macro-proxy` and `/api-proxy/*`.
+  - **Still public:** `/history` GET, the news, stock, STRC and whale proxies, the `/foufi-*` reads, `/risk-regime`,
+    `/hl-oi`, the `/alert-configs` and `/alert-log` reads, `/analysis` and `/security-status`.
+- **Third-party keys are Worker secrets.** `/macro-proxy` uses `FRED_API_KEY` and ignores any client-supplied key when
+  that secret is set. `/api-proxy/coingecko` and `/api-proxy/sosovalue` forward allowlisted upstream paths only,
+  with `CG_API_KEY` and `SOSO_API_KEY`.
+- **Tested deploys.** `deploy.yml` runs `npm test` before deploying.
+- **Frontend (CryptoPulse #7).** The page ships no secret. It adds the per-device token only to protected routes.
 
-## Owner runbook (in this order)
+**Consequence of fail-closed.** When the code deploys, every protected route refuses until the secret exists. The
+release order below is therefore mandatory.
 
-1. **Rotate at the providers.** Every key below is public and must be treated as compromised.
-   - **FRED:** at fredaccount.stlouisfed.org → API Keys, request a new key and delete the old one.
-   - **CoinGecko:** in the developer dashboard, create a new demo key and delete the old one.
-   - **SoSoValue:** in the account's API settings, regenerate the key.
-   - **Google Apps Script** (DCA alert sheet): change the shared secret that the script compares, then redeploy the
-     web app. The URL can stay the same.
-2. **Set the Worker secrets from a computer with wrangler.** The dashboard path failed to store a secret reliably on
-   2026-08-11.
-   ```
-   wrangler secret put V1_ACCESS_TOKEN     # e.g. output of: openssl rand -hex 32
-   wrangler secret put FRED_API_KEY
-   wrangler secret put CG_API_KEY
-   wrangler secret put SOSO_API_KEY
-   ```
-   Before the token is set, merging this PR only adds the proxies and the server-key preference: nothing is blocked.
-3. **Check:** `GET https://sentiment-ff75.quiquandon.workers.dev/security-status` should show
-   `route_auth: "enforced"` and `server_keys` all `true`.
-4. **On each device:** open V1 → Settings → "V1 access token" and paste the token. Do the same for the alert sheet
-   secret if you use DCA sync.
-5. **Merge the CryptoPulse PR.** The page then contains no secret.
-6. **Optional, recommended:** create a `production` environment with yourself as required reviewer in this
-   repository, and add `environment: production` to the deploy job, as PulseWorkerV2 already does.
+## Owner runbook
+
+The exact commands, expected outputs and checks are in `RELEASE_V1.md`. In short:
+
+1. **Rotate** the FRED, CoinGecko and SoSoValue keys and the Apps Script secret at each provider.
+2. **Set the Worker secrets first:** `V1_ACCESS_TOKEN` (`openssl rand -hex 32`), `FRED_API_KEY`, `CG_API_KEY` and
+   `SOSO_API_KEY`. The current code ignores them, so setting them first is harmless.
+3. **Merge this PR.** The deploy runs the tests, then deploys.
+4. **Check `/security-status`:** `route_auth` should read `enforced` and every `server_keys` entry should be `true`.
+5. **Merge CryptoPulse #7,** then enter the token on each device under Settings → Device access.
 
 ## Rollback
 
-- **Enforcement:** `wrangler secret delete V1_ACCESS_TOKEN` takes the gate back to open immediately, with no deploy.
+- **Enforcement:** there is no "open" mode any more. Deleting `V1_ACCESS_TOKEN` *closes* every protected route.
+  To undo the release, roll back the deployment (Cloudflare dashboard → Deployments → previous version, or
+  `wrangler rollback`) or revert the merge commit.
 - **Code:** revert the merge commit; the deploy runs the tests first.
