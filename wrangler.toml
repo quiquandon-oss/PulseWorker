@@ -1,6 +1,9 @@
 name = "sentiment-ff75"
 main = "worker.js"
 compatibility_date = "2024-11-01"
+# Keep variables set in the Cloudflare dashboard (HISTORY_PROVENANCE, SERVER_COMPOSITE, ...) across deploys.
+# Without this, every `wrangler deploy` from deploy.yml removes them and silently switches collection off.
+keep_vars = true
 
 [ai]
 binding = "AI"
