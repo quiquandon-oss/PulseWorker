@@ -142,6 +142,23 @@ describe('scomp-v1 collection', () => {
     const c = await S.collectServerSources(fakeEnv(freshDb()), { now: NOW, fetchImpl: f, sleep: noSleep });
     expect(c.observations.find((o) => o.source_id === 'onchain')).toMatchObject({ status: 'error', score: null, error: 'mempool.space: no difficultyChange' });
   });
+
+  it('sends a User-Agent to CoinGecko global (the keyless tier answers 403 without one)', async () => {
+    const S = load(stubs);
+    let init = null;
+    const f = net({ 'https://api.coingecko.com/api/v3/global': (u, i) => { init = i; return json({ data: { market_cap_change_percentage_24h_usd: -2.4, updated_at: Math.floor((NOW - 600000) / 1000) } }); } });
+    const c = await S.collectServerSources(fakeEnv(freshDb()), { now: NOW, fetchImpl: f, sleep: noSleep });
+    expect(init.headers['User-Agent']).toMatch(/^Mozilla\/5\.0 /);
+    expect(init.headers.accept).toBe('application/json');
+    expect(c.observations.find((o) => o.source_id === 'global')).toMatchObject({ status: 'ok', attempts: 1 });
+  });
+
+  it('a 403 from CoinGecko global is recorded as an error, not retried, never scored', async () => {
+    const S = load(stubs);
+    const f = net({ 'https://api.coingecko.com/api/v3/global': () => json({ status: { error_code: 403 } }, 403) });
+    const c = await S.collectServerSources(fakeEnv(freshDb()), { now: NOW, fetchImpl: f, sleep: noSleep });
+    expect(c.observations.find((o) => o.source_id === 'global')).toMatchObject({ status: 'error', score: null, error: 'HTTP 403', attempts: 1 });
+  });
 });
 
 describe('scomp-v1 Yahoo-based sources', () => {

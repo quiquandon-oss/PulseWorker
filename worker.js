@@ -1832,7 +1832,7 @@ async function collectServerSources(env, { now = Date.now(), fetchImpl = fetch, 
       return { fng: { score: v, observed_at: ts }, __attempts: res.attempts };
     }),
     run(['global'], async () => {
-      const res = await scompFetch('https://api.coingecko.com/api/v3/global', { headers: { accept: 'application/json' } }, opts);
+      const res = await scompFetch('https://api.coingecko.com/api/v3/global', { headers: { accept: 'application/json', 'User-Agent': SCOMP_YAHOO_UA } }, opts);
       const j = await res.json();
       const ts = Number.isFinite(j?.data?.updated_at) ? j.data.updated_at * 1000 : null;
       if (ts != null && now - ts > SCOMP_SOURCE_REGISTRY.global.maxAgeMs) return { global: { status: 'stale', observed_at: ts, error: 'CoinGecko global not updated for > 2 h' }, __attempts: res.attempts };
