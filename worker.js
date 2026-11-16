@@ -1950,6 +1950,27 @@ async function runServerComposite(env, { now = Date.now(), fetchImpl = fetch, sl
     n_ok: c.n_ok, n_missing: c.n_missing, duplicate: (res.at(-1)?.meta?.changes ?? 1) === 0 };
 }
 
+// Read-only hourly readings for display (V1 app chart, owner decision 2026-11-16): one row per hour slot, composite and
+// completeness only, oldest first. Below-floor readings are returned flagged (the client decides how to show them);
+// nothing here writes, and `history` is not read or changed. Bounded: at most 24 * 90 rows (one per slot).
+const SCOMP_READINGS_MAX_HOURS = 24 * 90;
+async function getServerCompositeReadings(env, now = Date.now(), hours = 168) {
+  const h = Math.min(SCOMP_READINGS_MAX_HOURS, Math.max(1, Math.floor(Number(hours)) || 168));
+  const since = now - h * SCOMP_H;
+  try {
+    const { results } = await env.DB.prepare(
+      'SELECT slot_ts, composite, completeness, below_floor, n_ok, n_missing FROM server_composite_readings WHERE slot_ts >= ? AND slot_ts <= ? ORDER BY slot_ts ASC LIMIT ?')
+      .bind(since, now, SCOMP_READINGS_MAX_HOURS + 1).all();
+    const readings = (results || []).map(r => ({ ts: Number(r.slot_ts), score: r.composite === null ? null : Number(r.composite),
+      completeness: Number(r.completeness), below_floor: Number(r.below_floor) === 1, n_ok: Number(r.n_ok), n_missing: Number(r.n_missing) }));
+    return { ok: true, enabled: env.SERVER_COMPOSITE === '1', version: SERVER_COMPOSITE_VERSION, weights_version: SENTIMENT_DEFAULT_WEIGHTS_VERSION,
+      hours: h, completeness_floor: SCOMP_COMPLETENESS_FLOOR, readings };
+  } catch (e) {
+    return { ok: false, enabled: env.SERVER_COMPOSITE === '1', version: SERVER_COMPOSITE_VERSION, readings: [],
+      error: /no such table/i.test(String(e.message)) ? 'tables not created: apply db/migrations/0002_server_composite.sql' : String(e.message || e) };
+  }
+}
+
 // Read-only coverage, freshness and completeness monitor over the last `hours`.
 async function getServerCompositeStatus(env, now = Date.now(), hours = 168) {
   const since = now - hours * SCOMP_H;
@@ -2111,6 +2132,11 @@ export default {
     if (url.pathname === '/server-composite/acceptance' && request.method === 'GET') {
       const hours = Math.min(168, Math.max(1, parseInt(url.searchParams.get('hours') || '24', 10) || 24));
       return new Response(JSON.stringify(await getServerCompositeAcceptance(env, Date.now(), hours)), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+    }
+    // GET /server-composite/readings?hours=168 -- read-only hourly server composite readings (V1 app chart).
+    if (url.pathname === '/server-composite/readings' && request.method === 'GET') {
+      const hours = parseInt(url.searchParams.get('hours') || '168', 10) || 168;
+      return new Response(JSON.stringify(await getServerCompositeReadings(env, Date.now(), hours)), { headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' } });
     }
     if (url.pathname === '/server-composite/status' && request.method === 'GET') {
       const hours = Math.min(24 * 90, Math.max(1, parseInt(url.searchParams.get('hours') || '168', 10) || 168));
