@@ -18,7 +18,7 @@ function load(stubs = {}) {
     constLine('V1_COMPOSITE_FORMULA'), objConst('SENTIMENT_DEFAULT_WEIGHTS'), constLine('SENTIMENT_DEFAULT_WEIGHTS_VERSION'),
     extractFunctions('parseRssTitles', 'stripHtml', 'recomputeComposite'),
     between('// ═══ Server-side V1 sentiment collection', 'export default {'),
-    'return { collectServerSources, buildServerComposite, runServerComposite, getServerCompositeStatus, evaluateCollectionAcceptance, getServerCompositeAcceptance, SCOMP_ACCEPTANCE, scompScoreHeadline, scompScoreHeadlineBatch, scompScorers, scompFetch, SCOMP_SENT_LEXICON, SCOMP_SOURCE_REGISTRY, SENTIMENT_DEFAULT_WEIGHTS };',
+    'return { collectServerSources, buildServerComposite, runServerComposite, getServerCompositeStatus, getServerCompositeReadings, evaluateCollectionAcceptance, getServerCompositeAcceptance, SCOMP_ACCEPTANCE, scompScoreHeadline, scompScoreHeadlineBatch, scompScorers, scompFetch, SCOMP_SENT_LEXICON, SCOMP_SOURCE_REGISTRY, SENTIMENT_DEFAULT_WEIGHTS };',
   ].join('\n\n');
   const names = Object.keys(stubs);
   return new Function(...names, body)(...names.map((n) => stubs[n]));
@@ -211,6 +211,34 @@ describe('scomp-v1 composite and persistence', () => {
     expect(st.ok).toBe(true);
     expect(st.readings.n).toBe(1);
     expect(st.sources.find((s) => s.id === 'fng').n_ok).toBe(1);
+  });
+
+  it('readings: one row per hour slot, oldest first, composite and completeness only, history untouched', async () => {
+    const S = load(stubs);
+    const db = freshDb();
+    db.exec('CREATE TABLE history (id INTEGER PRIMARY KEY, ts INTEGER, score INTEGER)');
+    const env = fakeEnv(db, { SERVER_COMPOSITE: '1' });
+    await S.runServerComposite(env, { now: NOW - 2 * H, fetchImpl: net(), sleep: noSleep });
+    await S.runServerComposite(env, { now: NOW, fetchImpl: net(), sleep: noSleep });
+    const r = await S.getServerCompositeReadings(env, NOW + 10 * 60000, 24);
+    expect(r).toMatchObject({ ok: true, enabled: true, version: 'scomp-v1', hours: 24, completeness_floor: 0.5 });
+    expect(r.readings.map((x) => x.ts)).toEqual([Math.floor((NOW - 2 * H) / H) * H, Math.floor(NOW / H) * H]);
+    expect(Object.keys(r.readings[0]).sort()).toEqual(['below_floor', 'completeness', 'n_missing', 'n_ok', 'score', 'ts']);
+    expect(typeof r.readings[0].score).toBe('number');
+    expect((await S.getServerCompositeReadings(env, NOW + 10 * 60000, 1)).readings).toHaveLength(1);
+    expect((await S.getServerCompositeReadings(env, NOW, 99999)).hours).toBe(24 * 90);
+    expect(db.prepare('SELECT COUNT(*) n FROM history').get().n).toBe(0);
+    const missing = await S.getServerCompositeReadings(fakeEnv(new DatabaseSync(':memory:')), NOW, 24);
+    expect(missing).toMatchObject({ ok: false, readings: [] });
+    expect(missing.error).toMatch(/apply db\/migrations\/0002/);
+  });
+
+  it('the readings route is GET only and read-only', () => {
+    const i = SRC.indexOf("url.pathname === '/server-composite/readings'");
+    expect(i).toBeGreaterThan(0);
+    const block = SRC.slice(i, SRC.indexOf('\n    }', i));
+    expect(block).toMatch(/request.method === 'GET'/);
+    expect(block).not.toMatch(/INSERT|UPDATE|DELETE/);
   });
 
   it('status reports missing tables instead of failing', async () => {
